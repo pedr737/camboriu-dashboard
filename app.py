@@ -110,7 +110,7 @@ components.html("""
   } catch (e) {}
 })();
 </script>
-""", height=0, width=0)
+""", height=0)
 
 # ── Paletas ───────────────────────────────────────────────────────────────────
 CORES_SEG = {
