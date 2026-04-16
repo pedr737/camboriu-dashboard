@@ -178,7 +178,16 @@ def apply_ptbr(fig):
 
 @st.cache_resource(show_spinner=False)
 def get_conn():
-    return psycopg2.connect(DB_URL)
+    if not DB_URL:
+        st.error("DB_URL vazio — configure em Settings → Secrets no Streamlit Cloud.")
+        st.stop()
+    try:
+        return psycopg2.connect(DB_URL, connect_timeout=10)
+    except Exception as e:
+        # Mostra o tipo do erro sem expor a connection string
+        st.error(f"Falha na conexão com o banco: {type(e).__name__}: {e}")
+        st.info(f"DB_URL presente: {'sim' if DB_URL else 'não'} | tamanho: {len(DB_URL)} chars")
+        st.stop()
 
 
 def qry(sql):
