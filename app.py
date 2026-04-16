@@ -25,7 +25,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_URL = st.secrets.get("DB_URL", "postgresql://postgres:camboriu-axivero@db.amvcvoicgvwgrudxeboa.supabase.co:5432/postgres?sslmode=require")
+DB_URL = st.secrets.get("DB_URL", "")  # configure em .streamlit/secrets.toml
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Autenticação simples
@@ -46,7 +46,7 @@ def _check_password() -> bool:
         pwd = st.text_input("Senha de acesso", type="password", label_visibility="collapsed",
                             placeholder="Senha de acesso")
         if st.button("Entrar", use_container_width=True):
-            senha_correta = st.secrets.get("SENHA", "camboriu")
+            senha_correta = st.secrets.get("SENHA", "")
             if pwd == senha_correta:
                 st.session_state["_auth"] = True
                 st.rerun()
