@@ -328,6 +328,83 @@ def load_vendedores():
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_orfas():
+    df = qry("""
+        SELECT
+            DATE_TRUNC('month', data_venda)::date          AS mes,
+            COALESCE(tabela_preco, 'Sem Segmento')         AS segmento,
+            COUNT(*)                                        AS total_vendas,
+            COUNT(*) FILTER (WHERE venda_orfa = true)       AS vendas_orfas,
+            ROUND(SUM(valor_total_liquido)::numeric / 100, 2)          AS valor_total_r,
+            ROUND((SUM(valor_total_liquido)
+                   FILTER (WHERE venda_orfa = true))::numeric / 100, 2) AS valor_orfas_r
+        FROM fato_vendas
+        WHERE status_venda IN ('Fechada','Fechado')
+          AND data_venda IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY 1
+    """)
+    df["mes"] = pd.to_datetime(df["mes"])
+    for c in ["total_vendas","vendas_orfas"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    for c in ["valor_total_r","valor_orfas_r"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(float)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_cohort_segmento():
+    df = qry("""
+        WITH primeira AS (
+            SELECT fv.cliente_id,
+                   COALESCE(dc.segmento_predominante,
+                            fv.tabela_preco, 'Sem Segmento')  AS segmento,
+                   DATE_TRUNC('month', MIN(fv.data_venda))::date AS mes_entrada
+            FROM fato_vendas fv
+            LEFT JOIN dim_clientes dc ON dc.id = fv.cliente_id
+            WHERE fv.cliente_id IS NOT NULL
+              AND fv.status_venda IN ('Fechada','Fechado')
+            GROUP BY 1, 2
+        ),
+        cohort_size AS (
+            SELECT segmento, mes_entrada,
+                   COUNT(DISTINCT cliente_id) AS tamanho
+            FROM primeira GROUP BY 1, 2
+        ),
+        meses_compra AS (
+            SELECT DISTINCT fv.cliente_id,
+                   DATE_TRUNC('month', fv.data_venda)::date AS mes
+            FROM fato_vendas fv
+            WHERE fv.cliente_id IS NOT NULL
+              AND fv.status_venda IN ('Fechada','Fechado')
+        ),
+        retencao AS (
+            SELECT p.segmento, p.mes_entrada,
+                   (EXTRACT(YEAR FROM AGE(mc.mes, p.mes_entrada))*12
+                    + EXTRACT(MONTH FROM AGE(mc.mes, p.mes_entrada)))::int
+                        AS meses_desde_entrada,
+                   COUNT(DISTINCT mc.cliente_id) AS clientes_retidos
+            FROM primeira p
+            JOIN meses_compra mc
+              ON mc.cliente_id = p.cliente_id AND mc.mes >= p.mes_entrada
+            GROUP BY 1, 2, 3
+        )
+        SELECT r.segmento, r.mes_entrada, r.meses_desde_entrada,
+               r.clientes_retidos, cs.tamanho AS tamanho_cohort,
+               ROUND(r.clientes_retidos * 100.0
+                     / NULLIF(cs.tamanho, 0), 1)::float AS pct_retencao
+        FROM retencao r
+        JOIN cohort_size cs
+          ON cs.segmento = r.segmento AND cs.mes_entrada = r.mes_entrada
+        WHERE r.mes_entrada >= '2024-01-01'
+          AND r.meses_desde_entrada <= 12
+        ORDER BY 1, 2, 3
+    """)
+    df["mes_entrada"] = pd.to_datetime(df["mes_entrada"])
+    return df
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +416,8 @@ with st.sidebar:
 
     painel = st.radio(
         "Painel",
-        ["Executivo", "Recorrência", "Sazonalidade", "Operacional", "Vendedores"],
+        ["Executivo", "Recorrência", "Sazonalidade", "Operacional", "Vendedores",
+         "Qualidade de Dados"],
         label_visibility="collapsed",
     )
 
@@ -369,6 +447,8 @@ with st.spinner("Carregando..."):
     df_novos = load_novos()
     df_pe    = load_cidades_pe()
     df_vend  = load_vendedores()
+    df_orfas = load_orfas()
+    df_cohort_seg = load_cohort_segmento()
 
 
 def seg(df, col="segmento"):
@@ -614,32 +694,57 @@ elif painel == "Recorrência":
     st.subheader("Retenção por cohort — % de clientes que voltaram a comprar")
     st.caption("Cada linha = grupo pelo mês da 1ª compra · Coluna 0 = mês de entrada · +N = N meses depois")
 
-    pivot = df_cohort.pivot_table(
-        index="mes_entrada", columns="meses_desde_entrada",
-        values="pct_retencao", aggfunc="mean",
+    cohort_seg_opts = ["Todos", "1 - Atacado", "2 - Varejo", "5 - Atacarejo"]
+    cohort_seg_sel = st.selectbox(
+        "Segmento (cohort)", cohort_seg_opts,
+        key="cohort_seg_filter",
     )
-    pivot.index = pd.to_datetime(pivot.index).strftime("%b/%Y")
-    pivot = pivot.iloc[::-1]
-    z_text = pivot.map(lambda v: f"{v:.0f}%" if pd.notna(v) else "")
 
-    fig = go.Figure(go.Heatmap(
-        z=pivot.values,
-        x=[f"+{c}m" for c in pivot.columns],
-        y=pivot.index.tolist(),
-        text=z_text.values,
-        texttemplate="%{text}",
-        colorscale=[[0,"#EA4335"],[0.15,"#FBBC04"],[0.40,"#34A853"],[1.0,"#1A73E8"]],
-        zmin=0, zmax=100,
-        colorbar=dict(title="% ret."),
-    ))
-    fig.update_layout(
-        height=max(320, len(pivot)*30),
-        margin=dict(l=0,r=0,t=10,b=0),
-        xaxis_title="Meses desde 1ª compra",
-        paper_bgcolor="#fff",
-    )
-    apply_ptbr(fig)
-    st.plotly_chart(fig, use_container_width=True)
+    if cohort_seg_sel == "Todos":
+        cohort_data = df_cohort
+    else:
+        cohort_data = df_cohort_seg[df_cohort_seg["segmento"] == cohort_seg_sel]
+        orf_seg = df_orfas[df_orfas["segmento"] == cohort_seg_sel]
+        if not orf_seg.empty:
+            _tv = orf_seg["total_vendas"].sum()
+            _to = orf_seg["vendas_orfas"].sum()
+            _pct = (_to / _tv * 100) if _tv else 0
+            if _pct > 20:
+                st.warning(
+                    f"{_pct:.0f}% das vendas de {cohort_seg_sel} são órfãs e não entram "
+                    f"na análise de cohort. A retenção exibida reflete apenas clientes "
+                    f"com CPF/CNPJ identificado."
+                )
+
+    if cohort_data.empty:
+        st.info("Sem dados de cohort para este segmento.")
+    else:
+        pivot = cohort_data.pivot_table(
+            index="mes_entrada", columns="meses_desde_entrada",
+            values="pct_retencao", aggfunc="mean",
+        )
+        pivot.index = pd.to_datetime(pivot.index).strftime("%b/%Y")
+        pivot = pivot.iloc[::-1]
+        z_text = pivot.map(lambda v: f"{v:.0f}%" if pd.notna(v) else "")
+
+        fig = go.Figure(go.Heatmap(
+            z=pivot.values,
+            x=[f"+{c}m" for c in pivot.columns],
+            y=pivot.index.tolist(),
+            text=z_text.values,
+            texttemplate="%{text}",
+            colorscale=[[0,"#EA4335"],[0.15,"#FBBC04"],[0.40,"#34A853"],[1.0,"#1A73E8"]],
+            zmin=0, zmax=100,
+            colorbar=dict(title="% ret."),
+        ))
+        fig.update_layout(
+            height=max(320, len(pivot)*30),
+            margin=dict(l=0,r=0,t=10,b=0),
+            xaxis_title="Meses desde 1ª compra",
+            paper_bgcolor="#fff",
+        )
+        apply_ptbr(fig)
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
@@ -1253,3 +1358,152 @@ elif painel == "Vendedores":
     fig.update_xaxes(showgrid=False)
     apply_ptbr(fig)
     st.plotly_chart(fig, use_container_width=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAINEL 6 — QUALIDADE DE DADOS
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif painel == "Qualidade de Dados":
+
+    st.title("Qualidade de Dados — Vendas Órfãs")
+    st.caption(
+        "Venda órfã = sem CPF/CNPJ registrado na transação, "
+        "impossibilitando o vínculo com o cliente. "
+        "Comum em PDV de varejo/atacarejo onde o operador não solicita o documento."
+    )
+
+    # ── Consolidação de segmentos ────────────────────────────────────────
+    _SEG_PRINCIPAIS = {"1 - Atacado", "2 - Varejo", "5 - Atacarejo"}
+    _orfas = df_orfas.copy()
+    _orfas["segmento"] = _orfas["segmento"].apply(
+        lambda s: s if s in _SEG_PRINCIPAIS else "Outros"
+    )
+
+    CORES_QD = {**CORES_SEG, "Outros": "#9E9E9E"}
+
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    orf_tot = _orfas.groupby("segmento", as_index=False).agg(
+        total_vendas=("total_vendas","sum"),
+        vendas_orfas=("vendas_orfas","sum"),
+        valor_total_r=("valor_total_r","sum"),
+        valor_orfas_r=("valor_orfas_r","sum"),
+    )
+    tot_v  = orf_tot["total_vendas"].sum()
+    tot_o  = orf_tot["vendas_orfas"].sum()
+    val_t  = orf_tot["valor_total_r"].sum()
+    val_o  = orf_tot["valor_orfas_r"].sum()
+    pct_vinc_val = ((val_t - val_o) / val_t * 100) if val_t else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Total de vendas",     fmt_num(tot_v))
+    with c2: st.metric("Vendas vinculadas",   fmt_num(tot_v - tot_o))
+    with c3: st.metric("Vendas órfãs",        fmt_num(tot_o))
+    with c4: st.metric("Faturamento coberto", f"{pct_vinc_val:.1f}%".replace(".",","))
+
+    st.divider()
+
+    # ── % de órfãs por segmento (qtd e valor) ────────────────────────────
+    st.subheader("Percentual de vendas órfãs por segmento")
+
+    orf_tot["pct_orfas_qtd"] = (
+        orf_tot["vendas_orfas"] / orf_tot["total_vendas"].replace(0, 1) * 100
+    ).round(1)
+    orf_tot["pct_orfas_val"] = (
+        orf_tot["valor_orfas_r"] / orf_tot["valor_total_r"].replace(0, 1) * 100
+    ).round(1)
+    orf_tot = orf_tot.sort_values("pct_orfas_qtd", ascending=True)
+
+    col_bar_q, col_bar_v = st.columns(2)
+
+    with col_bar_q:
+        st.markdown("**Por quantidade de vendas**")
+        fig = go.Figure(go.Bar(
+            x=orf_tot["pct_orfas_qtd"],
+            y=orf_tot["segmento"],
+            orientation="h",
+            marker_color=[CORES_QD.get(s, "#9E9E9E") for s in orf_tot["segmento"]],
+            text=orf_tot["pct_orfas_qtd"].apply(lambda v: f"{fmt_num(v,1)}%"),
+            textposition="outside",
+        ))
+        fig.update_layout(
+            height=280, margin=dict(l=0, r=60, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            xaxis_range=[0, min(orf_tot["pct_orfas_qtd"].max() * 1.25, 100)],
+        )
+        fig.update_xaxes(ticksuffix="%", gridcolor="#f0f0f0")
+        fig.update_yaxes(showgrid=False)
+        apply_ptbr(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_bar_v:
+        st.markdown("**Por valor faturado (R$)**")
+        orf_val_sorted = orf_tot.sort_values("pct_orfas_val", ascending=True)
+        fig = go.Figure(go.Bar(
+            x=orf_val_sorted["pct_orfas_val"],
+            y=orf_val_sorted["segmento"],
+            orientation="h",
+            marker_color=[CORES_QD.get(s, "#9E9E9E") for s in orf_val_sorted["segmento"]],
+            text=orf_val_sorted["pct_orfas_val"].apply(lambda v: f"{fmt_num(v,1)}%"),
+            textposition="outside",
+        ))
+        fig.update_layout(
+            height=280, margin=dict(l=0, r=60, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            xaxis_range=[0, min(orf_val_sorted["pct_orfas_val"].max() * 1.25, 100)],
+        )
+        fig.update_xaxes(ticksuffix="%", gridcolor="#f0f0f0")
+        fig.update_yaxes(showgrid=False)
+        apply_ptbr(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Evolução mensal do % de órfãs ────────────────────────────────────
+    st.subheader("Evolução mensal do percentual de órfãs")
+    st.caption("Tendência do % de vendas sem cliente identificado, por segmento")
+
+    orf_mes = _orfas[_orfas["mes"] >= "2024-01-01"].copy()
+    orf_mes_agg = orf_mes.groupby(["mes","segmento"], as_index=False).agg(
+        total_vendas=("total_vendas","sum"),
+        vendas_orfas=("vendas_orfas","sum"),
+    )
+    orf_mes_agg["pct_orfas"] = (
+        orf_mes_agg["vendas_orfas"]
+        / orf_mes_agg["total_vendas"].replace(0, 1) * 100
+    ).round(1)
+
+    fig = px.line(
+        orf_mes_agg, x="mes", y="pct_orfas", color="segmento",
+        color_discrete_map=CORES_QD, markers=True,
+        labels={"mes":"", "pct_orfas":"% órfãs", "segmento":"Segmento"},
+    )
+    fig.update_layout(
+        height=320, margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="h", y=-0.3, font_size=11),
+        plot_bgcolor="#fff", paper_bgcolor="#fff",
+        hovermode="x unified",
+    )
+    fig.update_yaxes(ticksuffix="%", gridcolor="#f0f0f0", rangemode="tozero")
+    fig.update_xaxes(showgrid=False)
+    apply_ptbr(fig)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Tabela resumo ────────────────────────────────────────────────────
+    st.subheader("Resumo por segmento")
+    tbl = orf_tot.sort_values("total_vendas", ascending=False).copy()
+    tbl["Vendas vinculadas"] = tbl["total_vendas"] - tbl["vendas_orfas"]
+    tbl["Valor vinculado"]   = (tbl["valor_total_r"] - tbl["valor_orfas_r"]).apply(fmt_brl)
+    tbl["Valor órfão"]       = tbl["valor_orfas_r"].apply(fmt_brl)
+    tbl["% órfãs (qtd)"]     = tbl["pct_orfas_qtd"].apply(lambda v: f"{fmt_num(v,1)}%")
+    tbl["% órfãs (valor)"]   = tbl["pct_orfas_val"].apply(lambda v: f"{fmt_num(v,1)}%")
+
+    exib_orf = tbl.rename(columns={
+        "segmento":"Segmento", "total_vendas":"Total vendas",
+        "vendas_orfas":"Vendas órfãs",
+    })[["Segmento","Total vendas","Vendas vinculadas","Vendas órfãs",
+        "% órfãs (qtd)","Valor vinculado","Valor órfão","% órfãs (valor)"]]
+
+    st.dataframe(exib_orf, use_container_width=True, hide_index=True)
