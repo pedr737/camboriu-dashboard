@@ -57,6 +57,15 @@ def _check_password() -> bool:
 if not _check_password():
     st.stop()
 
+# ── Teste de conexão (diagnóstico — remover depois de funcionar) ────────────
+try:
+    _test_conn = psycopg2.connect(DB_URL, connect_timeout=10)
+    _test_conn.close()
+except Exception as _e:
+    st.error(f"Erro de conexão: **{type(_e).__name__}** — {_e}")
+    st.info(f"DB_URL tem {len(DB_URL)} caracteres. Começa com: `{DB_URL[:25]}...`")
+    st.stop()
+
 # ── Fonte e estilos ───────────────────────────────────────────────────────────
 st.markdown("""
 <style>
