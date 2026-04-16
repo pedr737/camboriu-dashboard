@@ -1,6 +1,6 @@
-streamlit==1.56.0
+streamlit>=1.32.0
 pandas==2.2.3
-plotly==6.7.0
+plotly==5.24.1
 psycopg2-binary==2.9.11
 numpy==1.26.4
 openpyxl==3.1.5
