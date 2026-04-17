@@ -695,8 +695,6 @@ if painel == "Executivo":
     with c6: st.metric("Novos (30 dias)", fmt_num(n_novos_30),
                        delta=delta_novos_txt)
 
-    st.divider()
-
     # ── Faturamento mensal ─────────────────────────────────────────────────
     col_esq, col_dir = st.columns([3, 2])
 
@@ -1459,6 +1457,17 @@ elif painel == "Operacional":
     # ── Lista de reativação ───────────────────────────────────────────────
     st.subheader("Lista de clientes para reativação")
 
+    # Enriquece com vendedor predominante (por nº de vendas fechadas),
+    # que é mais útil operacionalmente do que o representante fixo do cadastro.
+    vend_map = (
+        df_cart[["id", "nome_exibicao"]]
+        .merge(df_cli_vend, left_on="id", right_on="cliente_id", how="inner")
+        .drop_duplicates("nome_exibicao")
+        .set_index("nome_exibicao")["vendedor_principal"]
+    )
+    reat_d = reat_d.copy()
+    reat_d["vendedor"] = reat_d["nome_exibicao"].map(vend_map)
+
     f1,f2,f3 = st.columns(3)
     with f1:
         st_sel = st.multiselect(
@@ -1469,12 +1478,12 @@ elif painel == "Operacional":
         ufs = ["Todos"] + sorted(reat_d["uf"].dropna().unique().tolist())
         uf_sel = st.selectbox("UF", ufs)
     with f3:
-        reps_opts = ["Todos"] + sorted(reat_d["representante_principal"].dropna().unique().tolist())
-        rep_sel = st.selectbox("Representante", reps_opts)
+        vend_opts = ["Todos"] + sorted(reat_d["vendedor"].dropna().unique().tolist())
+        vend_sel = st.selectbox("Vendedor", vend_opts)
 
     reat_f = reat_d[reat_d["status_cliente"].isin(st_sel)]
-    if uf_sel  != "Todos": reat_f = reat_f[reat_f["uf"]==uf_sel]
-    if rep_sel != "Todos": reat_f = reat_f[reat_f["representante_principal"]==rep_sel]
+    if uf_sel   != "Todos": reat_f = reat_f[reat_f["uf"]==uf_sel]
+    if vend_sel != "Todos": reat_f = reat_f[reat_f["vendedor"]==vend_sel]
 
     reat_f = reat_f.copy()
     if not reat_alvos.empty and "score" in reat_alvos.columns:
@@ -1511,19 +1520,24 @@ elif painel == "Operacional":
 
     exib_r = reat_f.rename(columns={
         "nome_exibicao":"Cliente","segmento":"Segmento","cidade":"Cidade","uf":"UF",
-        "representante_principal":"Representante","total_compras":"Compras",
+        "vendedor":"Vendedor","total_compras":"Compras",
         "dias_sem_compra":"Dias s/comprar",
-    })[["Cliente","Segmento","Cidade","UF","Representante","Status","Camada","Score",
+    })[["Cliente","Segmento","Cidade","UF","Vendedor","Status","Camada","Score",
         "Ultima Compra","Dias s/comprar","Compras","Fat. Total","Ticket Medio"]]
+    exib_r["Vendedor"] = exib_r["Vendedor"].fillna("—")
 
     st.dataframe(
         exib_r.style.map(_bg, subset=["Status"]).map(_bg_cam, subset=["Camada"]),
         use_container_width=True, height=460, hide_index=True,
     )
-    st.caption(f"{len(exib_r):,} clientes exibidos".replace(",","."))
+    n_str = f"{len(exib_r):,}".replace(",", ".")
+    st.caption(
+        f"{n_str} clientes exibidos · Vendedor = funcionário/vendedor "
+        "predominante (maior nº de vendas fechadas)"
+    )
 
     botao_csv(
-        reat_f[["nome_exibicao","segmento","cidade","uf","representante_principal",
+        reat_f[["nome_exibicao","segmento","cidade","uf","vendedor",
                 "status_cliente","camada","score","ultima_compra","dias_sem_compra",
                 "total_compras","valor_total_r","ticket_medio_r"]],
         "reativacao_camboriu", "Exportar lista (CSV)", key="csv_reat_full",
@@ -1701,55 +1715,6 @@ elif painel == "Vendedores":
 
     st.divider()
 
-    # ── Ticket médio vs volume de vendas (dispersão) ──────────────────────
-    st.subheader("Ticket médio vs volume de vendas")
-
-    disp = vend_seg.groupby("vendedor", as_index=False).agg(
-        vendas=("qtd_vendas","sum"),
-        ticket=("ticket_medio_r","mean"),
-        valor=("valor_total_r","sum"),
-    )
-
-    fig = px.scatter(
-        disp, x="vendas", y="ticket",
-        size="valor",
-        color="valor",
-        custom_data=["vendedor", "valor"],
-        color_continuous_scale=[[0,"#d2e3fc"],[1,"#1A73E8"]],
-        labels={"vendas":"Qtd vendas","ticket":"Ticket médio R$","valor":"Faturamento"},
-        size_max=55,
-    )
-    fig.update_traces(
-        marker=dict(opacity=0.85, line=dict(width=1, color="#fff")),
-        hovertemplate=(
-            "<b>%{customdata[0]}</b><br>"
-            "Qtd vendas: %{x:,.0f}<br>"
-            "Ticket médio: R$ %{y:,.0f}<br>"
-            "Faturamento: R$ %{customdata[1]:,.0f}<extra></extra>"
-        ),
-    )
-    # Anota apenas o top 5 por faturamento (evita poluição visual)
-    top5 = disp.nlargest(5, "valor")
-    for _, r in top5.iterrows():
-        fig.add_annotation(
-            x=r["vendas"], y=r["ticket"],
-            text=r["vendedor"].split()[0],  # só primeiro nome
-            showarrow=False,
-            yshift=14,
-            font=dict(size=10, color="#333"),
-        )
-    fig.update_layout(
-        height=440, margin=dict(l=0, r=0, t=10, b=0),
-        plot_bgcolor="#fff", paper_bgcolor="#fff",
-        coloraxis_showscale=False,
-    )
-    fig.update_yaxes(tickprefix="R$ ", gridcolor="#f0f0f0")
-    fig.update_xaxes(showgrid=False)
-    apply_ptbr(fig)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
     # ── Matriz qualidade da carteira por vendedor ─────────────────────────
     st.subheader("Matriz de qualidade da carteira por vendedor")
     st.caption(
@@ -1860,6 +1825,170 @@ elif painel == "Vendedores":
             botao_csv(tbl_q[["vendedor","total","pct_ativo","pct_risco",
                               "pct_perdido","valor"]],
                       "qualidade_carteira_vendedores", key="csv_qual_vend")
+
+    st.divider()
+
+    # ── Clientes para reativação por vendedor ─────────────────────────────
+    st.subheader("Clientes para reativação por vendedor")
+    st.caption(
+        "Cruza a carteira recuperável (em risco + hibernando + hibern. sazonal) "
+        "com o vendedor predominante de cada cliente. Camadas A/B/C vêm do "
+        "score RFV — prioriza operacionalmente quem vale mais recuperar."
+    )
+
+    recup = df_cart[df_cart["status_cliente"].isin(
+        ["em_risco", "hibernando", "hibernando_sazonal"]
+    )].copy()
+    if seg_filter != "Todos":
+        recup = recup[recup["segmento"] == seg_filter]
+
+    recup = recup.merge(df_cli_vend, left_on="id", right_on="cliente_id", how="inner")
+
+    if recup.empty:
+        st.info("Sem clientes recuperáveis atribuíveis a vendedores para o filtro atual.")
+    else:
+        recup = calcular_score_reativacao(recup)
+
+        # Agregação por vendedor × camada
+        ag = (recup.groupby(["vendedor_principal", "camada"], as_index=False)
+              .agg(n_cli=("id", "count"), valor=("valor_total_r", "sum")))
+
+        CAMADAS = ["A — Top 5%", "B — 6-20%", "C — restante"]
+        CORES_CAM = {
+            "A — Top 5%":   "#1A73E8",
+            "B — 6-20%":    "#F9AB00",
+            "C — restante": "#BDC1C6",
+        }
+
+        # Pivota para ter colunas por camada (tanto contagem quanto valor)
+        piv_n = ag.pivot_table(index="vendedor_principal", columns="camada",
+                                values="n_cli", fill_value=0)
+        piv_v = ag.pivot_table(index="vendedor_principal", columns="camada",
+                                values="valor", fill_value=0.0)
+        for cam in CAMADAS:
+            if cam not in piv_n.columns: piv_n[cam] = 0
+            if cam not in piv_v.columns: piv_v[cam] = 0.0
+
+        piv_n = piv_n[CAMADAS]
+        piv_v = piv_v[CAMADAS]
+        piv_n["Total"]  = piv_n.sum(axis=1)
+        piv_v["Valor"]  = piv_v.sum(axis=1)
+
+        # Ordem de prioridade: primeiro quem tem mais Camada A; depois B; depois C.
+        ordem = piv_n.sort_values(
+            by=["A — Top 5%", "B — 6-20%", "Total"], ascending=[False, False, False]
+        )
+        top_n = 15
+        ordem_top = ordem.head(top_n).index.tolist()
+
+        col_bar, col_lado = st.columns([3, 2])
+
+        with col_bar:
+            # Barras horizontais empilhadas por camada (contagem de clientes)
+            plot_df = piv_n.loc[ordem_top, CAMADAS].reset_index()
+            # Eixo Y invertido: maior prioridade no topo
+            y_order = list(reversed(ordem_top))
+
+            fig = go.Figure()
+            for cam in CAMADAS:
+                fig.add_trace(go.Bar(
+                    y=plot_df["vendedor_principal"],
+                    x=plot_df[cam],
+                    orientation="h",
+                    name=cam,
+                    marker_color=CORES_CAM[cam],
+                    text=plot_df[cam].astype(int).astype(str),
+                    textposition="inside",
+                    insidetextanchor="middle",
+                    textfont=dict(color="#fff", size=11),
+                    hovertemplate=f"<b>%{{y}}</b><br>{cam}: %{{x}} clientes<extra></extra>",
+                ))
+
+            fig.update_layout(
+                barmode="stack",
+                height=max(280, 32 * len(ordem_top) + 80),
+                margin=dict(l=0, r=10, t=10, b=0),
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                legend=dict(orientation="h", y=-0.12, x=0, font_size=11),
+                yaxis=dict(categoryorder="array", categoryarray=y_order),
+            )
+            fig.update_xaxes(
+                title_text="Clientes recuperáveis",
+                showgrid=True, gridcolor="#f0f0f0",
+            )
+            fig.update_yaxes(showgrid=False)
+            apply_ptbr(fig)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_lado:
+            # KPI agregado + tabela lado a lado (Top 5 por Camada A)
+            total_recup   = int(piv_n["Total"].sum())
+            total_valor   = float(piv_v["Valor"].sum())
+            total_cam_a   = int(piv_n["A — Top 5%"].sum())
+
+            k1, k2 = st.columns(2)
+            with k1:
+                st.metric("Clientes recuperáveis", fmt_num(total_recup),
+                          help="Em risco + hibernando + hibern. sazonal com vendedor atribuído")
+            with k2:
+                st.metric("Valor histórico", fmt_brl(total_valor, compact=True),
+                          help="Soma do faturamento histórico desses clientes")
+            st.metric("Dentro da Camada A (prioridade)", fmt_num(total_cam_a))
+
+            # Tabela compacta: top 10 por Camada A
+            tabela = piv_n.join(piv_v["Valor"]).loc[ordem_top].copy()
+            tabela["Valor hist."] = tabela["Valor"].apply(lambda v: fmt_brl(v, compact=True))
+            tabela = tabela.reset_index().rename(columns={
+                "vendedor_principal": "Vendedor",
+                "A — Top 5%": "A", "B — 6-20%": "B", "C — restante": "C",
+            })[["Vendedor", "A", "B", "C", "Total", "Valor hist."]]
+            st.caption(f"Top {len(tabela)} por concentração de Camada A")
+            st.dataframe(tabela, use_container_width=True, hide_index=True, height=380)
+
+        # Tabela completa expandida + CSV da lista detalhada
+        with st.expander("Lista completa — clientes recuperáveis por vendedor",
+                         expanded=False):
+            detail = recup[[
+                "vendedor_principal", "nome_exibicao", "segmento", "cidade", "uf",
+                "status_cliente", "camada", "score", "ultima_compra",
+                "dias_sem_compra", "total_compras", "valor_total_r", "ticket_medio_r",
+            ]].copy()
+            detail = detail.sort_values(
+                ["vendedor_principal", "score"], ascending=[True, False]
+            )
+
+            exib_det = detail.rename(columns={
+                "vendedor_principal": "Vendedor",
+                "nome_exibicao": "Cliente",
+                "segmento": "Segmento",
+                "cidade": "Cidade",
+                "uf": "UF",
+                "camada": "Camada",
+                "total_compras": "Compras",
+                "dias_sem_compra": "Dias s/comprar",
+            })
+            exib_det["Status"]       = exib_det["status_cliente"].map(LABEL_STATUS)
+            exib_det["Ult. Compra"]  = pd.to_datetime(
+                exib_det["ultima_compra"], errors="coerce"
+            ).dt.strftime("%d/%m/%Y")
+            exib_det["Fat. Total"]   = exib_det["valor_total_r"].apply(fmt_brl)
+            exib_det["Ticket Medio"] = exib_det["ticket_medio_r"].apply(fmt_brl)
+            exib_det["Score"]        = exib_det["score"].apply(
+                lambda v: f"{float(v):.2f}".replace(".", ",") if pd.notna(v) else "—"
+            )
+
+            st.dataframe(
+                exib_det[[
+                    "Vendedor", "Cliente", "Segmento", "Cidade", "UF",
+                    "Status", "Camada", "Score", "Ult. Compra",
+                    "Dias s/comprar", "Compras", "Fat. Total", "Ticket Medio",
+                ]],
+                use_container_width=True, hide_index=True, height=420,
+            )
+            botao_csv(
+                detail, "reativacao_por_vendedor",
+                "Exportar lista (CSV)", key="csv_reat_vend",
+            )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
