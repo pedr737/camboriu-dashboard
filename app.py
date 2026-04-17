@@ -181,6 +181,66 @@ def apply_ptbr(fig):
     fig.update_layout(separators=",.")
     return fig
 
+
+def botao_csv(df: pd.DataFrame, nome: str, label: str = "Exportar CSV", key: str | None = None):
+    """Download em formato brasileiro (separador ;, decimal ,, UTF-8 BOM)."""
+    csv = df.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig")
+    st.download_button(label, csv, f"{nome}.csv", "text/csv", key=key)
+
+
+def calcular_score_reativacao(df: pd.DataFrame) -> pd.DataFrame:
+    """Score RFV composto: 0.5·V + 0.3·F + 0.2·R_inv.
+
+    Valor = ticket_medio / ticket_medio_segmento (cap 3)
+    Frequência = total_compras / mediana_segmento (cap 3)
+    Recência invertida = max(0, 1 - dias_sem_compra/365)
+    Modificador sazonal: +0.2 em out-dez para clientes sazonais.
+    """
+    df = df.copy()
+    if "segmento" not in df.columns or df.empty:
+        df["score"] = 0.0
+        df["camada"] = "C — restante"
+        return df
+
+    tm_seg = df.groupby("segmento")["ticket_medio_r"].transform("mean").replace(0, pd.NA)
+    f_seg  = df.groupby("segmento")["total_compras"].transform("median").replace(0, pd.NA)
+
+    df["v_norm"] = (df["ticket_medio_r"] / tm_seg).clip(upper=3).fillna(0)
+    df["f_norm"] = (df["total_compras"] / f_seg).clip(upper=3).fillna(0)
+    df["r_inv"]  = (1 - df["dias_sem_compra"] / 365).clip(lower=0).fillna(0)
+    df["score"]  = 0.5 * df["v_norm"] + 0.3 * df["f_norm"] + 0.2 * df["r_inv"]
+
+    hoje = pd.Timestamp.now()
+    if hoje.month in (10, 11, 12) and "perfil_sazonalidade" in df.columns:
+        df.loc[df["perfil_sazonalidade"] == "Sazonal", "score"] += 0.2
+
+    rank_pct = df["score"].rank(pct=True, ascending=False)
+    df["camada"] = pd.cut(
+        rank_pct,
+        bins=[0, 0.05, 0.20, 1.01],
+        labels=["A — Top 5%", "B — 6-20%", "C — restante"],
+        include_lowest=True,
+    )
+    return df.sort_values("score", ascending=False)
+
+
+def aplicar_periodo(df: pd.DataFrame, periodo: str, col: str) -> pd.DataFrame:
+    """Filtra df pela coluna de data conforme o período escolhido."""
+    if periodo == "Desde o início" or col not in df.columns or df.empty:
+        return df
+    hoje = pd.Timestamp(date.today())
+    if periodo == "Últimos 12 meses":
+        ini = hoje - pd.DateOffset(months=12)
+        return df[df[col] >= ini]
+    if periodo == "Últimos 24 meses":
+        ini = hoje - pd.DateOffset(months=24)
+        return df[df[col] >= ini]
+    if periodo == "Ano atual":
+        return df[df[col].dt.year == hoje.year]
+    if periodo == "Ano anterior":
+        return df[df[col].dt.year == (hoje.year - 1)]
+    return df
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conexão e cache
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +338,7 @@ def load_cohort():
         SELECT mes_entrada, meses_desde_entrada,
                clientes_retidos, tamanho_cohort, pct_retencao::float
         FROM vw_ls_cohort_simples
-        WHERE mes_entrada >= '2024-01-01' AND meses_desde_entrada <= 12
+        WHERE mes_entrada >= '2024-03-01' AND meses_desde_entrada <= 12
         ORDER BY mes_entrada, meses_desde_entrada
     """)
     df["mes_entrada"] = pd.to_datetime(df["mes_entrada"])
@@ -354,6 +414,36 @@ def load_orfas():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_cliente_vendedor():
+    """Vendedor predominante por cliente — maior nº de vendas fechadas."""
+    df = qry("""
+        WITH v AS (
+            SELECT cliente_id,
+                   funcionario_vendedor,
+                   COUNT(*)                          AS n_vendas,
+                   SUM(valor_total_liquido)::float   AS valor
+            FROM fato_vendas
+            WHERE cliente_id IS NOT NULL
+              AND funcionario_vendedor IS NOT NULL
+              AND status_venda IN ('Fechada','Fechado')
+            GROUP BY 1, 2
+        ),
+        ranked AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY cliente_id
+                       ORDER BY n_vendas DESC, valor DESC, funcionario_vendedor
+                   ) AS rn
+            FROM v
+        )
+        SELECT cliente_id,
+               funcionario_vendedor AS vendedor_principal
+        FROM ranked WHERE rn = 1
+    """)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_cohort_segmento():
     df = qry("""
         WITH primeira AS (
@@ -397,7 +487,7 @@ def load_cohort_segmento():
         FROM retencao r
         JOIN cohort_size cs
           ON cs.segmento = r.segmento AND cs.mes_entrada = r.mes_entrada
-        WHERE r.mes_entrada >= '2024-01-01'
+        WHERE r.mes_entrada >= '2024-03-01'
           AND r.meses_desde_entrada <= 12
         ORDER BY 1, 2, 3
     """)
@@ -409,15 +499,30 @@ def load_cohort_segmento():
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 
+PAINEIS = ["Executivo", "Recorrência", "Sazonalidade", "Operacional", "Vendedores",
+           "Qualidade de Dados"]
+
+if "painel" not in st.session_state:
+    st.session_state["painel"] = "Executivo"
+if "seg_filter" not in st.session_state:
+    st.session_state["seg_filter"] = "Todos"
+if "periodo" not in st.session_state:
+    st.session_state["periodo"] = "Últimos 24 meses"
+
+# Navegação entre painéis via botões: consumir _nav_target ANTES do radio
+# (Streamlit não permite alterar session_state[key] após o widget existir).
+if "_nav_target" in st.session_state:
+    _target = st.session_state.pop("_nav_target")
+    if _target in PAINEIS:
+        st.session_state["painel"] = _target
+
 with st.sidebar:
     st.markdown("## Camboriú")
     st.caption("Gestão de Carteira · 2024–2026")
     st.divider()
 
     painel = st.radio(
-        "Painel",
-        ["Executivo", "Recorrência", "Sazonalidade", "Operacional", "Vendedores",
-         "Qualidade de Dados"],
+        "Painel", PAINEIS, key="painel",
         label_visibility="collapsed",
     )
 
@@ -425,7 +530,14 @@ with st.sidebar:
     st.caption("Filtros")
 
     seg_options = ["Todos", "1 - Atacado", "2 - Varejo", "5 - Atacarejo"]
-    seg_filter = st.selectbox("Segmento", seg_options)
+    seg_filter = st.selectbox("Segmento", seg_options, key="seg_filter")
+
+    periodo = st.selectbox(
+        "Período",
+        ["Últimos 12 meses", "Últimos 24 meses", "Ano atual",
+         "Ano anterior", "Desde o início"],
+        key="periodo",
+    )
 
     st.divider()
     if st.button("Recarregar dados"):
@@ -439,16 +551,23 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.spinner("Carregando..."):
-    df_fat   = load_faturamento()
-    df_cart  = load_carteira()
-    df_reat  = load_reativacao()
-    df_pag   = load_pagamentos()
-    df_cohort= load_cohort()
-    df_novos = load_novos()
-    df_pe    = load_cidades_pe()
-    df_vend  = load_vendedores()
-    df_orfas = load_orfas()
+    df_fat_full   = load_faturamento()
+    df_cart       = load_carteira()
+    df_reat       = load_reativacao()
+    df_pag_full   = load_pagamentos()
+    df_cohort     = load_cohort()
+    df_novos_full = load_novos()
+    df_pe         = load_cidades_pe()
+    df_vend_full  = load_vendedores()
+    df_orfas_full = load_orfas()
     df_cohort_seg = load_cohort_segmento()
+    df_cli_vend   = load_cliente_vendedor()
+
+df_fat   = aplicar_periodo(df_fat_full,   periodo, "mes")
+df_pag   = aplicar_periodo(df_pag_full,   periodo, "mes")
+df_novos = aplicar_periodo(df_novos_full, periodo, "mes_primeira_compra")
+df_vend  = aplicar_periodo(df_vend_full,  periodo, "mes")
+df_orfas = aplicar_periodo(df_orfas_full, periodo, "mes")
 
 
 def seg(df, col="segmento"):
@@ -465,6 +584,66 @@ if painel == "Executivo":
 
     st.title("Visão Executiva")
 
+    # ── Cálculos-base para headline e KPIs ────────────────────────────────
+    cart_ativa = df_cart[df_cart["status_cliente"] != "sem_compra"]
+    cart_seg   = seg(cart_ativa)
+
+    total_base   = len(cart_seg)
+    ativos       = (cart_seg["status_cliente"] == "ativo").sum()
+    em_risco     = (cart_seg["status_cliente"] == "em_risco").sum()
+    hibernando   = cart_seg["status_cliente"].isin(["hibernando","hibernando_sazonal"]).sum()
+    perdidos     = (cart_seg["status_cliente"] == "perdido").sum()
+    pct_fora     = ((em_risco + hibernando + perdidos) / total_base * 100) if total_base else 0
+
+    # Retenção m+1 dos últimos 6 cohorts (só para leitura de tese)
+    coh_m1 = df_cohort[df_cohort["meses_desde_entrada"] == 1].sort_values("mes_entrada")
+    retm1_recent = coh_m1.tail(6)["pct_retencao"].mean() if not coh_m1.empty else None
+    retm1_prev   = coh_m1.iloc[-12:-6]["pct_retencao"].mean() if len(coh_m1) >= 12 else None
+
+    # Valor em clientes recuperáveis (em risco + hibernando)
+    valor_recup = cart_seg[cart_seg["status_cliente"].isin(
+        ["em_risco","hibernando","hibernando_sazonal"]
+    )]["valor_total_r"].sum()
+
+    # ── Headline dinâmica ─────────────────────────────────────────────────
+    parts = []
+    parts.append(f"<b>{fmt_num(total_base)} clientes</b> na carteira, "
+                 f"<b>{pct_fora:.0f}%</b> fora da janela de compra recente.")
+    if retm1_recent is not None and retm1_prev is not None and retm1_recent < retm1_prev * 0.75:
+        parts.append(f"Retenção m+1 caiu de <b>{retm1_prev:.0f}%</b> para "
+                     f"<b>{retm1_recent:.0f}%</b> nos 6 cohorts mais recentes.")
+    elif retm1_recent is not None:
+        parts.append(f"Retenção m+1 média (últimos 6 cohorts): <b>{retm1_recent:.0f}%</b>.")
+    parts.append(f"<b>{fmt_brl(valor_recup, compact=True)}</b> em clientes recuperáveis.")
+
+    st.markdown(
+        f"<div style='font-size:1.02rem; line-height:1.7; color:#222; "
+        f"padding:14px 18px; background:#f8f9fa; border-left:4px solid #1A73E8; "
+        f"border-radius:4px; margin-bottom:18px;'>"
+        f"{' '.join(parts)}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Cards de ação (navegação entre painéis) ──────────────────────────
+    ca1, ca2, ca3 = st.columns(3)
+    with ca1:
+        if st.button("Top clientes para reativação →",
+                     use_container_width=True, key="nav_reat"):
+            st.session_state["_nav_target"] = "Operacional"
+            st.rerun()
+    with ca2:
+        if st.button("Vendedores com carteira em risco →",
+                     use_container_width=True, key="nav_vend"):
+            st.session_state["_nav_target"] = "Vendedores"
+            st.rerun()
+    with ca3:
+        if st.button("Cohorts e retenção →",
+                     use_container_width=True, key="nav_cohort"):
+            st.session_state["_nav_target"] = "Recorrência"
+            st.rerun()
+
+    st.divider()
+
     # Definições de status — expander discreto
     with st.expander("Definições de status de cliente", expanded=False):
         st.markdown("""
@@ -478,34 +657,43 @@ if painel == "Executivo":
 </div>
 """, unsafe_allow_html=True)
 
-    # ── KPIs ──────────────────────────────────────────────────────────────
-    cart_ativa = df_cart[df_cart["status_cliente"] != "sem_compra"]
-    cart_seg   = seg(cart_ativa)
+    # ── KPIs com delta vs período anterior equivalente ────────────────────
+    hoje = pd.Timestamp(date.today())
+    fat_seg = seg(df_fat)
+    fat_atual = fat_seg["valor_total_r"].sum()
 
-    ativos     = (cart_seg["status_cliente"] == "ativo").sum()
-    em_risco   = (cart_seg["status_cliente"] == "em_risco").sum()
-    hibernando = cart_seg["status_cliente"].isin(["hibernando","hibernando_sazonal"]).sum()
-    perdidos   = (cart_seg["status_cliente"] == "perdido").sum()
+    delta_fat_txt = None
+    fat_full_seg = seg(df_fat_full)
+    if not fat_seg.empty:
+        mes_min = fat_seg["mes"].min()
+        mes_max = fat_seg["mes"].max()
+        meses_span = (mes_max.year - mes_min.year) * 12 + (mes_max.month - mes_min.month) + 1
+        ant_max = mes_min - pd.DateOffset(months=1)
+        ant_min = ant_max - pd.DateOffset(months=meses_span - 1)
+        fat_ant = fat_full_seg[
+            (fat_full_seg["mes"] >= ant_min) & (fat_full_seg["mes"] <= ant_max)
+        ]["valor_total_r"].sum()
+        if fat_ant > 0:
+            delta_fat_txt = f"{(fat_atual - fat_ant) / fat_ant * 100:+.1f}% vs anterior"
 
-    hoje      = pd.Timestamp(date.today())
-    fat_seg   = seg(df_fat)
-    fat_12m   = fat_seg["valor_total_r"].sum()
-    fat_12m_s = fmt_brl(fat_12m, compact=True)
-
-    novos_30 = df_cart[
-        (hoje - df_cart["primeira_compra"]).dt.days <= 30
-    ]
+    novos_30 = df_cart[(hoje - df_cart["primeira_compra"]).dt.days.between(0, 30)]
+    novos_60 = df_cart[(hoje - df_cart["primeira_compra"]).dt.days.between(31, 60)]
     if seg_filter != "Todos":
         novos_30 = novos_30[novos_30["segmento"] == seg_filter]
+        novos_60 = novos_60[novos_60["segmento"] == seg_filter]
     n_novos_30 = len(novos_30)
+    n_novos_60 = len(novos_60)
+    delta_novos_txt = f"{n_novos_30 - n_novos_60:+d} vs 30d anteriores" if n_novos_60 else None
 
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     with c1: st.metric("Ativos",         fmt_num(ativos))
     with c2: st.metric("Em Risco",        fmt_num(em_risco))
     with c3: st.metric("Hibernando",      fmt_num(hibernando))
     with c4: st.metric("Perdidos",        fmt_num(perdidos))
-    with c5: st.metric("Faturamento (período)", fat_12m_s)
-    with c6: st.metric("Novos (30 dias)", fmt_num(n_novos_30))
+    with c5: st.metric("Faturamento (período)", fmt_brl(fat_atual, compact=True),
+                       delta=delta_fat_txt)
+    with c6: st.metric("Novos (30 dias)", fmt_num(n_novos_30),
+                       delta=delta_novos_txt)
 
     st.divider()
 
@@ -534,21 +722,32 @@ if painel == "Executivo":
     with col_dir:
         st.subheader("Distribuição da carteira")
         status_counts = cart_seg.groupby("status_cliente").size().reset_index(name="n")
-        status_counts["label"] = status_counts["status_cliente"].map(LABEL_STATUS)
-        status_counts["cor"]   = status_counts["status_cliente"].map(CORES_STATUS)
+        status_val    = cart_seg.groupby("status_cliente")["valor_total_r"].sum().reset_index(name="valor")
+        status_df     = status_counts.merge(status_val, on="status_cliente")
+        status_df["label"] = status_df["status_cliente"].map(LABEL_STATUS)
+        status_df["cor"]   = status_df["status_cliente"].map(CORES_STATUS)
+        status_df = status_df.sort_values("n", ascending=True)
 
-        fig = go.Figure(go.Pie(
-            labels=status_counts["label"],
-            values=status_counts["n"],
-            marker_colors=status_counts["cor"],
-            hole=0.45,
-            textinfo="label+percent",
-            insidetextorientation="radial",
+        status_df["rotulo"] = status_df.apply(
+            lambda r: f"{fmt_num(r['n'])} · {fmt_brl(r['valor'], compact=True)}", axis=1
+        )
+
+        fig = go.Figure(go.Bar(
+            x=status_df["n"],
+            y=status_df["label"],
+            orientation="h",
+            marker_color=status_df["cor"],
+            text=status_df["rotulo"],
+            textposition="outside",
+            cliponaxis=False,
         ))
         fig.update_layout(
-            height=300, margin=dict(l=0,r=0,t=10,b=0), showlegend=False,
-            paper_bgcolor="#fff",
+            height=300, margin=dict(l=0, r=140, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            showlegend=False,
         )
+        fig.update_xaxes(showgrid=True, gridcolor="#f0f0f0", title_text="Clientes")
+        fig.update_yaxes(showgrid=False)
         apply_ptbr(fig)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -680,6 +879,7 @@ if painel == "Executivo":
         exib.style.map(cor_status, subset=["Status"]),
         use_container_width=True, height=430, hide_index=True,
     )
+    botao_csv(exib, "top20_atacadistas_camboriu", key="csv_top20")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -690,28 +890,95 @@ elif painel == "Recorrência":
 
     st.title("Recorrência e Comportamento")
 
+    # ── KPIs de topo ─────────────────────────────────────────────────────
+    cart_ativa = df_cart[df_cart["status_cliente"] != "sem_compra"]
+    cart_seg_r = seg(cart_ativa)
+
+    # Retenção m+1 (últimos 6 cohorts) — do df_cohort global
+    coh_m1 = df_cohort[df_cohort["meses_desde_entrada"] == 1].sort_values("mes_entrada")
+    retm1_atual  = coh_m1.tail(6)["pct_retencao"].mean() if len(coh_m1) >= 1 else None
+    retm1_passado = coh_m1.iloc[-12:-6]["pct_retencao"].mean() if len(coh_m1) >= 12 else None
+    delta_retm1 = (
+        f"{retm1_atual - retm1_passado:+.1f}pp vs 6 cohorts anteriores"
+        if (retm1_atual is not None and retm1_passado is not None) else None
+    )
+
+    # % clientes com 3+ compras
+    n_total = len(cart_seg_r)
+    n_3mais = (cart_seg_r["total_compras"] >= 3).sum()
+    pct_3mais = (n_3mais / n_total * 100) if n_total else 0
+
+    # Gap mediano entre compras (estimado: (ultima - primeira) / (compras - 1))
+    rec_df = cart_seg_r[cart_seg_r["total_compras"] >= 2].copy()
+    if not rec_df.empty:
+        rec_df["gap"] = (
+            (rec_df["ultima_compra"] - rec_df["primeira_compra"]).dt.days
+            / (rec_df["total_compras"] - 1)
+        )
+        gap_mediana = rec_df["gap"].median()
+    else:
+        gap_mediana = None
+
+    # Clientes com 1 compra só (nunca voltaram)
+    n_unica = (cart_seg_r["total_compras"] == 1).sum()
+    pct_unica = (n_unica / n_total * 100) if n_total else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric(
+            "Retenção m+1 (últimos 6 cohorts)",
+            f"{retm1_atual:.1f}%".replace(".", ",") if retm1_atual is not None else "—",
+            delta=delta_retm1,
+        )
+    with c2:
+        st.metric("Clientes com 3+ compras", fmt_num(n_3mais),
+                  delta=f"{pct_3mais:.1f}% da base".replace(".", ","))
+    with c3:
+        st.metric(
+            "Gap mediano entre compras",
+            f"{int(gap_mediana)} dias" if gap_mediana is not None else "—",
+        )
+    with c4:
+        st.metric("Compraram 1 vez e não voltaram", fmt_num(n_unica),
+                  delta=f"{pct_unica:.1f}% da base".replace(".", ","))
+
+    st.divider()
+
     # ── Cohort ────────────────────────────────────────────────────────────
     st.subheader("Retenção por cohort — % de clientes que voltaram a comprar")
     st.caption("Cada linha = grupo pelo mês da 1ª compra · Coluna 0 = mês de entrada · +N = N meses depois")
 
-    cohort_seg_opts = ["Todos", "1 - Atacado", "2 - Varejo", "5 - Atacarejo"]
-    cohort_seg_sel = st.selectbox(
-        "Segmento (cohort)", cohort_seg_opts,
-        key="cohort_seg_filter",
+    st.info(
+        "Cohorts anteriores a mar/2024 foram omitidos — os primeiros meses da base "
+        "incluíam clientes com histórico anterior ao período importado, o que inflava "
+        "artificialmente a retenção e distorcia a comparação."
     )
 
-    if cohort_seg_sel == "Todos":
+    # Override local do segmento (explícito), default = filtro global da sidebar
+    with st.expander("Segmento do cohort (opcional — sobrepõe o filtro global)", expanded=False):
+        cohort_seg_sel = st.selectbox(
+            "Segmento (cohort)",
+            ["Usar filtro global", "Todos", "1 - Atacado", "2 - Varejo", "5 - Atacarejo"],
+            key="cohort_seg_filter",
+        )
+
+    if cohort_seg_sel == "Usar filtro global":
+        seg_efetivo = seg_filter
+    else:
+        seg_efetivo = cohort_seg_sel
+
+    if seg_efetivo == "Todos":
         cohort_data = df_cohort
     else:
-        cohort_data = df_cohort_seg[df_cohort_seg["segmento"] == cohort_seg_sel]
-        orf_seg = df_orfas[df_orfas["segmento"] == cohort_seg_sel]
+        cohort_data = df_cohort_seg[df_cohort_seg["segmento"] == seg_efetivo]
+        orf_seg = df_orfas[df_orfas["segmento"] == seg_efetivo]
         if not orf_seg.empty:
             _tv = orf_seg["total_vendas"].sum()
             _to = orf_seg["vendas_orfas"].sum()
             _pct = (_to / _tv * 100) if _tv else 0
             if _pct > 20:
                 st.warning(
-                    f"{_pct:.0f}% das vendas de {cohort_seg_sel} são órfãs e não entram "
+                    f"{_pct:.0f}% das vendas de {seg_efetivo} são órfãs e não entram "
                     f"na análise de cohort. A retenção exibida reflete apenas clientes "
                     f"com CPF/CNPJ identificado."
                 )
@@ -723,6 +990,7 @@ elif painel == "Recorrência":
             index="mes_entrada", columns="meses_desde_entrada",
             values="pct_retencao", aggfunc="mean",
         )
+        pivot_raw = pivot.copy()
         pivot.index = pd.to_datetime(pivot.index).strftime("%b/%Y")
         pivot = pivot.iloc[::-1]
         z_text = pivot.map(lambda v: f"{v:.0f}%" if pd.notna(v) else "")
@@ -745,6 +1013,36 @@ elif painel == "Recorrência":
         )
         apply_ptbr(fig)
         st.plotly_chart(fig, use_container_width=True)
+
+        # ── Linha-resumo: retenção média por trimestre de entrada ─────────
+        resumo_tri = cohort_data.assign(
+            tri=pd.to_datetime(cohort_data["mes_entrada"]).dt.to_period("Q").astype(str)
+        ).groupby(["tri","meses_desde_entrada"])["pct_retencao"].mean().unstack()
+
+        if not resumo_tri.empty:
+            st.markdown("**Retenção média por trimestre de entrada — leitura de tendência**")
+            fig = go.Figure()
+            cores_m = {1: "#1A73E8", 3: "#34A853", 6: "#F9AB00"}
+            for m in [1, 3, 6]:
+                if m in resumo_tri.columns:
+                    fig.add_trace(go.Scatter(
+                        x=resumo_tri.index, y=resumo_tri[m],
+                        name=f"m+{m}", mode="lines+markers",
+                        line=dict(color=cores_m[m], width=2.5),
+                        marker=dict(size=8),
+                    ))
+            fig.update_layout(
+                height=260, margin=dict(l=0,r=0,t=10,b=0),
+                hovermode="x unified",
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                legend=dict(orientation="h", y=-0.3, font_size=11),
+                xaxis_title="Trimestre de entrada do cohort",
+                yaxis_title="% retenção média",
+            )
+            fig.update_yaxes(ticksuffix="%", gridcolor="#f0f0f0", rangemode="tozero")
+            fig.update_xaxes(showgrid=False)
+            apply_ptbr(fig)
+            st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
@@ -1092,6 +1390,72 @@ elif painel == "Operacional":
 
     st.divider()
 
+    # ── Score RFV + carteira enriquecida ──────────────────────────────────
+    # Aplicado somente aos recuperáveis (em risco + hibernando sazonal/normal).
+    reat_alvos = reat_d[reat_d["status_cliente"].isin(
+        ["em_risco", "hibernando", "hibernando_sazonal"]
+    )].copy()
+
+    if not reat_alvos.empty:
+        saz_map = (
+            df_cart.drop_duplicates("nome_exibicao")
+            .set_index("nome_exibicao")["perfil_sazonalidade"]
+            .to_dict()
+        )
+        reat_alvos["perfil_sazonalidade"] = reat_alvos["nome_exibicao"].map(saz_map)
+        reat_alvos = calcular_score_reativacao(reat_alvos)
+
+    # ── Cartões das camadas A/B/C ─────────────────────────────────────────
+    st.subheader("Camadas por score RFV")
+    st.caption(
+        "Score = 0,5·Valor + 0,3·Frequência + 0,2·Recência invertida · "
+        "Modificador sazonal +0,2 para clientes sazonais em Out–Dez"
+    )
+
+    def _camada(df, rotulo):
+        sub = df[df["camada"] == rotulo] if "camada" in df.columns else df.head(0)
+        n = len(sub)
+        v = sub["valor_total_r"].sum() if n else 0
+        return sub, n, v
+
+    cam_a, n_a, v_a = _camada(reat_alvos, "A — Top 5%")
+    cam_b, n_b, v_b = _camada(reat_alvos, "B — 6-20%")
+    cam_c, n_c, v_c = _camada(reat_alvos, "C — restante")
+
+    CARD_CSS = (
+        "padding:14px 16px; border-radius:8px; border:1px solid #e0e0e0; "
+        "background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.04);"
+    )
+
+    def _card(col, titulo, n, v, cor_borda):
+        with col:
+            st.markdown(
+                f"<div style='{CARD_CSS} border-left:4px solid {cor_borda};'>"
+                f"<div style='font-size:0.78rem; color:#666; font-weight:600; "
+                f"text-transform:uppercase; letter-spacing:0.04em;'>{titulo}</div>"
+                f"<div style='font-size:1.45rem; font-weight:700; color:#111; "
+                f"margin-top:4px;'>{fmt_num(n)} clientes</div>"
+                f"<div style='font-size:0.9rem; color:#333; margin-top:2px;'>"
+                f"{fmt_brl(v, compact=True)} em valor histórico</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    col_a, col_b, col_c = st.columns(3)
+    _card(col_a, "Camada A — Top 5%",   n_a, v_a, "#1A73E8")
+    _card(col_b, "Camada B — 6 a 20%",  n_b, v_b, "#F9AB00")
+    _card(col_c, "Camada C — restante", n_c, v_c, "#BDC1C6")
+
+    exp_a, exp_b, exp_c = st.columns(3)
+    with exp_a:
+        if n_a: botao_csv(cam_a, "reativacao_camada_A", "Baixar Camada A", key="csv_cam_a")
+    with exp_b:
+        if n_b: botao_csv(cam_b, "reativacao_camada_B", "Baixar Camada B", key="csv_cam_b")
+    with exp_c:
+        if n_c: botao_csv(cam_c, "reativacao_camada_C", "Baixar Camada C", key="csv_cam_c")
+
+    st.divider()
+
     # ── Lista de reativação ───────────────────────────────────────────────
     st.subheader("Lista de clientes para reativação")
 
@@ -1113,33 +1477,57 @@ elif painel == "Operacional":
     if rep_sel != "Todos": reat_f = reat_f[reat_f["representante_principal"]==rep_sel]
 
     reat_f = reat_f.copy()
+    if not reat_alvos.empty and "score" in reat_alvos.columns:
+        score_map = (
+            reat_alvos.drop_duplicates("nome_exibicao")
+            .set_index("nome_exibicao")[["score", "camada"]]
+        )
+        reat_f = reat_f.join(score_map, on="nome_exibicao")
+    else:
+        reat_f["score"]  = pd.NA
+        reat_f["camada"] = pd.NA
+
+    reat_f = reat_f.sort_values("score", ascending=False, na_position="last")
+
     reat_f["Fat. Total"]    = reat_f["valor_total_r"].apply(fmt_brl)
     reat_f["Ticket Medio"]  = reat_f["ticket_medio_r"].apply(fmt_brl)
     reat_f["Ultima Compra"] = reat_f["ultima_compra"].dt.strftime("%d/%m/%Y")
     reat_f["Status"]        = reat_f["status_cliente"].map(LABEL_STATUS)
+    reat_f["Score"]         = reat_f["score"].apply(
+        lambda v: f"{float(v):.2f}".replace(".", ",") if pd.notna(v) else "—"
+    )
+    reat_f["Camada"]        = reat_f["camada"].astype("object").fillna("—")
 
     def _bg(val):
         m={"Em Risco":"background-color:#fff3cd","Hibernando":"background-color:#ffe0b2",
            "Perdido":"background-color:#f8d7da","Hibern. Sazonal":"background-color:#ffe0b2"}
         return m.get(val,"")
 
+    def _bg_cam(val):
+        m={"A — Top 5%":"background-color:#d2e3fc;color:#0d47a1;font-weight:600",
+           "B — 6-20%":"background-color:#fff3cd;color:#856404",
+           "C — restante":"background-color:#f1f3f4;color:#555"}
+        return m.get(str(val),"")
+
     exib_r = reat_f.rename(columns={
         "nome_exibicao":"Cliente","segmento":"Segmento","cidade":"Cidade","uf":"UF",
         "representante_principal":"Representante","total_compras":"Compras",
         "dias_sem_compra":"Dias s/comprar",
-    })[["Cliente","Segmento","Cidade","UF","Representante","Status",
+    })[["Cliente","Segmento","Cidade","UF","Representante","Status","Camada","Score",
         "Ultima Compra","Dias s/comprar","Compras","Fat. Total","Ticket Medio"]]
 
     st.dataframe(
-        exib_r.style.map(_bg, subset=["Status"]),
+        exib_r.style.map(_bg, subset=["Status"]).map(_bg_cam, subset=["Camada"]),
         use_container_width=True, height=460, hide_index=True,
     )
     st.caption(f"{len(exib_r):,} clientes exibidos".replace(",","."))
 
-    csv = reat_f[["nome_exibicao","segmento","cidade","uf","representante_principal",
-                  "status_cliente","ultima_compra","dias_sem_compra","total_compras",
-                  "valor_total_r","ticket_medio_r"]].to_csv(index=False).encode("utf-8")
-    st.download_button("Exportar lista (CSV)", csv, "reativacao_camboriu.csv", "text/csv")
+    botao_csv(
+        reat_f[["nome_exibicao","segmento","cidade","uf","representante_principal",
+                "status_cliente","camada","score","ultima_compra","dias_sem_compra",
+                "total_compras","valor_total_r","ticket_medio_r"]],
+        "reativacao_camboriu", "Exportar lista (CSV)", key="csv_reat_full",
+    )
 
     st.divider()
 
@@ -1156,13 +1544,14 @@ elif painel == "Operacional":
     novos60["Ticket Medio"] = novos60["ticket_medio_r"].apply(fmt_brl)
     novos60["1a Compra"]    = novos60["primeira_compra"].dt.strftime("%d/%m/%Y")
 
-    st.dataframe(
-        novos60.rename(columns={"nome_exibicao":"Cliente","total_compras":"Compras"})[
-            ["Cliente","segmento","cidade","uf","1a Compra","Compras","Fat. Total","Ticket Medio"]
-        ],
-        use_container_width=True, height=300, hide_index=True,
-    )
+    exib_novos = novos60.rename(
+        columns={"nome_exibicao":"Cliente","total_compras":"Compras"}
+    )[["Cliente","segmento","cidade","uf","1a Compra","Compras","Fat. Total","Ticket Medio"]]
+
+    st.dataframe(exib_novos, use_container_width=True, height=300, hide_index=True)
     st.caption(f"{len(novos60):,} novos clientes nos últimos 60 dias".replace(",","."))
+    if not novos60.empty:
+        botao_csv(exib_novos, "novos_clientes_60d", key="csv_novos60")
 
     st.divider()
 
@@ -1236,12 +1625,12 @@ elif painel == "Vendedores":
     with col_tbl:
         rank["Faturamento"]  = rank["valor"].apply(fmt_brl)
         rank["Ticket Medio"] = rank["ticket"].apply(fmt_brl)
-        st.dataframe(
-            rank.rename(columns={
-                "vendedor":"Vendedor","vendas":"Vendas","clientes":"Clientes",
-            })[["Vendedor","Vendas","Clientes","Faturamento","Ticket Medio"]],
-            use_container_width=True, height=460, hide_index=True,
-        )
+        exib_rank = rank.rename(columns={
+            "vendedor":"Vendedor","vendas":"Vendas","clientes":"Clientes",
+        })[["Vendedor","Vendas","Clientes","Faturamento","Ticket Medio"]]
+        st.dataframe(exib_rank, use_container_width=True, height=460, hide_index=True)
+        botao_csv(rank[["vendedor","vendas","clientes","valor","ticket"]],
+                  "ranking_vendedores", key="csv_rank_vend")
 
     st.divider()
 
@@ -1358,6 +1747,119 @@ elif painel == "Vendedores":
     fig.update_xaxes(showgrid=False)
     apply_ptbr(fig)
     st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Matriz qualidade da carteira por vendedor ─────────────────────────
+    st.subheader("Matriz de qualidade da carteira por vendedor")
+    st.caption(
+        "Cada cliente é atribuído ao vendedor com mais vendas fechadas para ele "
+        "(via `funcionario_vendedor` em fato_vendas). Quadrantes indicam quem "
+        "fideliza versus quem queima leads."
+    )
+
+    cart_q = df_cart[df_cart["status_cliente"] != "sem_compra"].copy()
+    if seg_filter != "Todos":
+        cart_q = cart_q[cart_q["segmento"] == seg_filter]
+
+    # Vincula cliente ↔ vendedor via fato_vendas
+    cart_q = cart_q.merge(df_cli_vend, left_on="id", right_on="cliente_id", how="inner")
+
+    q = cart_q.groupby(["vendedor_principal", "status_cliente"]).size().unstack(fill_value=0)
+    for c in ["ativo", "em_risco", "hibernando", "hibernando_sazonal", "perdido"]:
+        if c not in q.columns:
+            q[c] = 0
+    q["total"] = q[["ativo","em_risco","hibernando","hibernando_sazonal","perdido"]].sum(axis=1)
+    q = q[q["total"] >= 20]
+    q["pct_ativo"]   = q["ativo"] / q["total"] * 100
+    q["pct_risco"]   = (q["em_risco"] + q["hibernando"] + q["hibernando_sazonal"]) / q["total"] * 100
+    q["pct_perdido"] = q["perdido"] / q["total"] * 100
+
+    q = q.reset_index().rename(columns={"vendedor_principal": "vendedor"})
+    q = q.merge(rank[["vendedor","valor","vendas"]], on="vendedor", how="inner")
+
+    if q.empty:
+        st.info("Sem vendedores com ≥20 clientes atribuídos para o filtro atual.")
+    else:
+        mx = q["pct_ativo"].median()
+        my = q["valor"].median()
+
+        fig = px.scatter(
+            q, x="pct_ativo", y="valor",
+            size="total", color="pct_risco",
+            hover_name="vendedor",
+            color_continuous_scale=[[0, "#34A853"], [0.5, "#F9AB00"], [1, "#E8453C"]],
+            custom_data=["vendedor","total","pct_risco","pct_perdido","vendas"],
+            labels={
+                "pct_ativo":"% da carteira ativa",
+                "valor":"Faturamento R$",
+                "pct_risco":"% em risco/hibernando",
+                "total":"Clientes",
+            },
+            size_max=48,
+        )
+        fig.update_traces(
+            marker=dict(opacity=0.85, line=dict(width=1, color="#fff")),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Carteira: %{customdata[1]:,.0f} clientes · %{customdata[4]:,.0f} vendas<br>"
+                "% ativa: %{x:.1f}%<br>"
+                "% risco/hibernando: %{customdata[2]:.1f}%<br>"
+                "% perdidos: %{customdata[3]:.1f}%<br>"
+                "Faturamento: R$ %{y:,.0f}<extra></extra>"
+            ),
+        )
+        fig.add_vline(x=mx, line_dash="dot", line_color="#999",
+                      annotation_text=f"mediana {mx:.0f}%",
+                      annotation_position="top")
+        fig.add_hline(y=my, line_dash="dot", line_color="#999",
+                      annotation_text=f"mediana {fmt_brl(my, compact=True)}",
+                      annotation_position="right")
+
+        # Rótulos dos 5 maiores
+        for _, r in q.nlargest(5, "valor").iterrows():
+            fig.add_annotation(
+                x=r["pct_ativo"], y=r["valor"],
+                text=r["vendedor"].split()[0],
+                showarrow=False, yshift=14,
+                font=dict(size=10, color="#333"),
+            )
+
+        fig.update_layout(
+            height=440, margin=dict(l=0, r=0, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            coloraxis=dict(colorbar=dict(title="% risco", ticksuffix="%")),
+        )
+        fig.update_xaxes(ticksuffix="%", gridcolor="#f0f0f0")
+        fig.update_yaxes(tickprefix="R$ ", tickformat=",.0f", gridcolor="#f0f0f0")
+        apply_ptbr(fig)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(
+            "<div style='font-size:0.82rem; color:#555; line-height:1.55;'>"
+            "<b>Leitura dos quadrantes:</b> superior-direito = estrelas "
+            "(alto faturamento, alta retenção); superior-esquerdo = "
+            "queimam leads (alto faturamento, baixa retenção); "
+            "inferior-direito = subaproveitados (bom pós-venda, pouco volume); "
+            "inferior-esquerdo = atenção."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Tabela + exportação
+        tbl_q = q.sort_values("pct_ativo", ascending=False).copy()
+        tbl_q["Faturamento"]   = tbl_q["valor"].apply(fmt_brl)
+        tbl_q["% ativa"]       = tbl_q["pct_ativo"].apply(lambda v: f"{fmt_num(v,1)}%")
+        tbl_q["% risco/hib"]   = tbl_q["pct_risco"].apply(lambda v: f"{fmt_num(v,1)}%")
+        tbl_q["% perdidos"]    = tbl_q["pct_perdido"].apply(lambda v: f"{fmt_num(v,1)}%")
+        exib_q = tbl_q.rename(columns={"vendedor":"Vendedor","total":"Clientes"})[
+            ["Vendedor","Clientes","% ativa","% risco/hib","% perdidos","Faturamento"]
+        ]
+        with st.expander(f"Tabela completa — {len(exib_q)} vendedores", expanded=False):
+            st.dataframe(exib_q, use_container_width=True, hide_index=True)
+            botao_csv(tbl_q[["vendedor","total","pct_ativo","pct_risco",
+                              "pct_perdido","valor"]],
+                      "qualidade_carteira_vendedores", key="csv_qual_vend")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1507,3 +2009,8 @@ elif painel == "Qualidade de Dados":
         "% órfãs (qtd)","Valor vinculado","Valor órfão","% órfãs (valor)"]]
 
     st.dataframe(exib_orf, use_container_width=True, hide_index=True)
+    botao_csv(
+        tbl[["segmento","total_vendas","vendas_orfas","pct_orfas_qtd",
+             "valor_total_r","valor_orfas_r","pct_orfas_val"]],
+        "qualidade_dados_orfas", key="csv_orfas",
+    )
