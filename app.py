@@ -188,18 +188,25 @@ def botao_csv(df: pd.DataFrame, nome: str, label: str = "Exportar CSV", key: str
     st.download_button(label, csv, f"{nome}.csv", "text/csv", key=key)
 
 
-def calcular_score_reativacao(df: pd.DataFrame) -> pd.DataFrame:
-    """Score RFV composto: 0.5·V + 0.3·F + 0.2·R_inv.
+def calcular_score_rfv(df: pd.DataFrame) -> pd.DataFrame:
+    """Score RFV composto aplicado sobre qualquer subset da carteira.
 
-    Valor = ticket_medio / ticket_medio_segmento (cap 3)
-    Frequência = total_compras / mediana_segmento (cap 3)
-    Recência invertida = max(0, 1 - dias_sem_compra/365)
-    Modificador sazonal: +0.2 em out-dez para clientes sazonais.
+    Score = 0.5·V + 0.3·F + 0.2·R_inv
+      - V = ticket_medio / média_do_segmento  (cap 3)
+      - F = total_compras / mediana_do_segmento (cap 3)
+      - R_inv = max(0, 1 - dias_sem_compra/365)
+
+    Modificador sazonal: +0.2 em Out–Dez para clientes com perfil "Sazonal".
+
+    Camadas (percentis do score dentro do subset passado):
+      - A — Alto valor (Top 5%)
+      - B — Médio valor (6 a 20%)
+      - C — Base (restante)
     """
     df = df.copy()
     if "segmento" not in df.columns or df.empty:
         df["score"] = 0.0
-        df["camada"] = "C — restante"
+        df["camada"] = "C — Base"
         return df
 
     tm_seg = df.groupby("segmento")["ticket_medio_r"].transform("mean").replace(0, pd.NA)
@@ -207,6 +214,7 @@ def calcular_score_reativacao(df: pd.DataFrame) -> pd.DataFrame:
 
     df["v_norm"] = (df["ticket_medio_r"] / tm_seg).clip(upper=3).fillna(0)
     df["f_norm"] = (df["total_compras"] / f_seg).clip(upper=3).fillna(0)
+    # Quem não comprou ainda (sem_compra) → dias_sem_compra NaN → r_inv = 0
     df["r_inv"]  = (1 - df["dias_sem_compra"] / 365).clip(lower=0).fillna(0)
     df["score"]  = 0.5 * df["v_norm"] + 0.3 * df["f_norm"] + 0.2 * df["r_inv"]
 
@@ -218,10 +226,14 @@ def calcular_score_reativacao(df: pd.DataFrame) -> pd.DataFrame:
     df["camada"] = pd.cut(
         rank_pct,
         bins=[0, 0.05, 0.20, 1.01],
-        labels=["A — Top 5%", "B — 6-20%", "C — restante"],
+        labels=["A — Alto valor", "B — Médio valor", "C — Base"],
         include_lowest=True,
     )
     return df.sort_values("score", ascending=False)
+
+
+# Alias retrocompatível — antigo nome ainda referenciado em alguns pontos.
+calcular_score_reativacao = calcular_score_rfv
 
 
 def aplicar_periodo(df: pd.DataFrame, periodo: str, col: str) -> pd.DataFrame:
@@ -499,7 +511,7 @@ def load_cohort_segmento():
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 
-PAINEIS = ["Executivo", "Recorrência", "Sazonalidade", "Operacional", "Vendedores",
+PAINEIS = ["Executivo", "Recorrência", "Sazonalidade", "Estratégia de Carteira", "Vendedores",
            "Qualidade de Dados"]
 
 if "painel" not in st.session_state:
@@ -629,7 +641,7 @@ if painel == "Executivo":
     with ca1:
         if st.button("Top clientes para reativação →",
                      use_container_width=True, key="nav_reat"):
-            st.session_state["_nav_target"] = "Operacional"
+            st.session_state["_nav_target"] = "Estratégia de Carteira"
             st.rerun()
     with ca2:
         if st.button("Vendedores com carteira em risco →",
@@ -851,33 +863,154 @@ if painel == "Executivo":
     apply_ptbr(fig)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Top 20 Atacadistas ─────────────────────────────────────────────────
-    st.subheader("Top 20 clientes por faturamento — Atacado")
-    top20 = df_cart[df_cart["segmento"]=="1 - Atacado"].nlargest(20,"valor_total_r").copy()
-    top20["Status"]        = top20["status_cliente"].map(LABEL_STATUS)
-    top20["Fat. Total"]    = top20["valor_total_r"].apply(fmt_brl)
-    top20["Ticket Medio"]  = top20["ticket_medio_r"].apply(fmt_brl)
-    top20["Ultima Compra"] = top20["ultima_compra"].dt.strftime("%d/%m/%Y")
+    st.divider()
 
-    def cor_status(val):
-        m = {
-            "Ativo":           "background-color:#d4edda;color:#155724",
-            "Em Risco":        "background-color:#fff3cd;color:#856404",
-            "Hibernando":      "background-color:#ffe0b2;color:#e65100",
-            "Perdido":         "background-color:#f8d7da;color:#721c24",
-            "Hibern. Sazonal": "background-color:#ffe0b2;color:#e65100",
-        }
-        return m.get(val, "")
+    # ═══════════════════════════════════════════════════════════════════════
+    # Alto valor (LTV) — patrimônio da carteira
+    # ═══════════════════════════════════════════════════════════════════════
+    st.subheader("Alto valor — patrimônio da carteira")
 
-    exib = top20.rename(columns={
-        "nome_exibicao":"Cliente","cidade":"Cidade","uf":"UF","total_compras":"Compras",
-    })[["Cliente","Cidade","UF","Compras","Ultima Compra","Fat. Total","Ticket Medio","Status"]]
+    with st.expander("O que é LTV e como interpretar", expanded=False):
+        st.markdown("""
+<div style='font-size:0.88rem; line-height:1.6; color:#333;'>
+<b>LTV</b> = faturamento histórico total de cada cliente. Não decai com o tempo (diferente do RFV) — mede patrimônio.<br>
+<b>Pareto</b>: quanto mais inclinada a curva no início, maior a dependência de poucos clientes. LTV alto + status fora de "Ativo" = patrimônio em risco.
+</div>
+""", unsafe_allow_html=True)
 
-    st.dataframe(
-        exib.style.map(cor_status, subset=["Status"]),
-        use_container_width=True, height=430, hide_index=True,
-    )
-    botao_csv(exib, "top20_atacadistas_camboriu", key="csv_top20")
+    ltv_base = df_cart[df_cart["status_cliente"] != "sem_compra"].copy()
+    if seg_filter != "Todos":
+        ltv_base = ltv_base[ltv_base["segmento"] == seg_filter]
+
+    if ltv_base.empty:
+        st.info("Sem clientes na base para o filtro atual.")
+    else:
+        ltv_base = ltv_base.sort_values("valor_total_r", ascending=False).reset_index(drop=True)
+        ltv_total = ltv_base["valor_total_r"].sum()
+        n_cli     = len(ltv_base)
+
+        # Concentração Pareto: Top 20%
+        n_top20 = max(1, int(round(n_cli * 0.20)))
+        val_top20 = ltv_base.head(n_top20)["valor_total_r"].sum()
+        pct_top20 = (val_top20 / ltv_total * 100) if ltv_total else 0
+
+        # Patrimônio fora de ativo
+        fora = ltv_base[ltv_base["status_cliente"] != "ativo"]
+        val_fora = fora["valor_total_r"].sum()
+        pct_fora = (val_fora / ltv_total * 100) if ltv_total else 0
+        n_fora = len(fora)
+
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.metric(
+                "LTV total da carteira",
+                fmt_brl(ltv_total, compact=True),
+                help="Soma do faturamento histórico de todos os clientes que já compraram",
+            )
+        with k2:
+            st.metric(
+                "Concentração Top 20%",
+                f"{pct_top20:.0f}%".replace(".", ","),
+                help=f"% do LTV concentrado nos {fmt_num(n_top20)} maiores clientes",
+            )
+        with k3:
+            st.metric(
+                "Patrimônio fora de ativo",
+                fmt_brl(val_fora, compact=True),
+                delta=f"{fmt_num(n_fora)} clientes · {pct_fora:.0f}%".replace(".", ","),
+                delta_color="inverse",
+                help="LTV dos clientes em risco, hibernando ou perdidos",
+            )
+
+        # ── Top N clientes por LTV ────────────────────────────────────────
+        top_n = 20
+        topLTV = ltv_base.head(top_n).copy()
+        topLTV["Status"]       = topLTV["status_cliente"].map(LABEL_STATUS)
+        topLTV["LTV"]          = topLTV["valor_total_r"].apply(fmt_brl)
+        topLTV["Ticket Medio"] = topLTV["ticket_medio_r"].apply(fmt_brl)
+        topLTV["Ult. Compra"]  = topLTV["ultima_compra"].dt.strftime("%d/%m/%Y")
+
+        def cor_status(val):
+            m = {
+                "Ativo":           "background-color:#d4edda;color:#155724",
+                "Em Risco":        "background-color:#fff3cd;color:#856404",
+                "Hibernando":      "background-color:#ffe0b2;color:#e65100",
+                "Perdido":         "background-color:#f8d7da;color:#721c24",
+                "Hibern. Sazonal": "background-color:#ffe0b2;color:#e65100",
+            }
+            return m.get(val, "")
+
+        exib = topLTV.rename(columns={
+            "nome_exibicao": "Cliente", "segmento": "Segmento",
+            "cidade": "Cidade", "uf": "UF", "total_compras": "Compras",
+        })[["Cliente", "Segmento", "Cidade", "UF", "Compras",
+            "Ult. Compra", "LTV", "Ticket Medio", "Status"]]
+
+        st.markdown(f"##### Top {top_n} clientes por LTV")
+        st.dataframe(
+            exib.style.map(cor_status, subset=["Status"]),
+            use_container_width=True, height=430, hide_index=True,
+        )
+        botao_csv(
+            ltv_base[["nome_exibicao", "segmento", "cidade", "uf", "status_cliente",
+                      "total_compras", "ultima_compra",
+                      "valor_total_r", "ticket_medio_r"]],
+            "ltv_carteira_camboriu",
+            "Exportar carteira completa por LTV (CSV)",
+            key="csv_ltv_full",
+        )
+
+        # ── Curva de Pareto inline (linha fina) ───────────────────────────
+        pareto = ltv_base[["valor_total_r"]].copy()
+        pareto["cum_val"] = pareto["valor_total_r"].cumsum()
+        pareto["pct_cum_val"] = pareto["cum_val"] / ltv_total * 100
+        pareto["pct_cum_cli"] = (pareto.index + 1) / n_cli * 100
+
+        fig_p = go.Figure()
+        fig_p.add_trace(go.Scatter(
+            x=pareto["pct_cum_cli"], y=pareto["pct_cum_val"],
+            mode="lines", line=dict(color="#1A73E8", width=2.5),
+            fill="tozeroy", fillcolor="rgba(26,115,232,0.08)",
+            hovertemplate="Top %{x:.0f}% dos clientes → "
+                          "%{y:.0f}% do LTV<extra></extra>",
+            name="Curva de Pareto",
+        ))
+        # Linha diagonal (distribuição uniforme teórica)
+        fig_p.add_trace(go.Scatter(
+            x=[0, 100], y=[0, 100], mode="lines",
+            line=dict(color="#ccc", dash="dot", width=1.2),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig_p.add_vline(
+            x=20, line_dash="dot", line_color="#888",
+            annotation_text="Top 20%", annotation_position="top right",
+        )
+        fig_p.update_layout(
+            height=240, margin=dict(l=0, r=0, t=24, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            showlegend=False,
+            title=dict(
+                text="<b>Curva de concentração (Pareto)</b> · "
+                     "% acumulado de clientes × % acumulado de LTV",
+                font=dict(size=12, color="#444"), x=0, xanchor="left", y=0.98,
+            ),
+        )
+        fig_p.update_xaxes(range=[0, 100], ticksuffix="%",
+                           gridcolor="#f0f0f0",
+                           title_text="% acumulado de clientes (ordenados por LTV)")
+        fig_p.update_yaxes(range=[0, 100], ticksuffix="%",
+                           gridcolor="#f0f0f0",
+                           title_text="% acumulado de LTV")
+        apply_ptbr(fig_p)
+        st.plotly_chart(fig_p, use_container_width=True)
+
+        st.caption(
+            f"Leitura: **os {fmt_num(n_top20)} maiores clientes (Top 20%) concentram "
+            f"{pct_top20:.0f}% do LTV da carteira**. ".replace(".0%", "%")
+            + f"Destes, **{fmt_brl(val_fora, compact=True)}** estão fora de ativo — é o "
+              "patrimônio em risco que merece cuidado prioritário. Para acionar, "
+              "veja o painel **Estratégia de Carteira**."
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -945,6 +1078,37 @@ elif painel == "Recorrência":
     # ── Cohort ────────────────────────────────────────────────────────────
     st.subheader("Retenção por cohort — % de clientes que voltaram a comprar")
     st.caption("Cada linha = grupo pelo mês da 1ª compra · Coluna 0 = mês de entrada · +N = N meses depois")
+
+    with st.expander("Como ler a matriz de cohort", expanded=False):
+        st.markdown("""
+<div style='font-size:0.88rem; line-height:1.6; color:#333;'>
+
+<b>Cohort</b> é um grupo de clientes que entrou na carteira no mesmo mês (1ª compra).
+A matriz mostra, para cada cohort, quantos <b>voltaram a comprar</b> nos meses seguintes.
+
+<b>Exemplo:</b> se em <i>mar/2024</i> entraram 100 clientes e 40 deles compraram
+novamente em algum momento de <i>abr/2024</i>, a retenção m+1 do cohort de mar/2024
+é <b>40%</b>.
+
+<b>Leitura da matriz:</b>
+
+<ul style='margin-top:6px;'>
+<li><b>Cada linha</b> = um cohort (mês de entrada na carteira)</li>
+<li><b>Cada coluna</b> = meses decorridos desde a entrada (m0, m+1, m+2, …)</li>
+<li><b>Cor mais escura</b> = retenção maior naquele ponto</li>
+</ul>
+
+<b>Por que m+1 importa tanto?</b> É o primeiro teste de fidelização. Se o cliente
+não volta no mês seguinte, a probabilidade dele voltar depois cai muito. Uma
+retenção m+1 crescente ao longo dos cohorts indica que a qualidade dos novos
+clientes está melhorando; uma queda indica o oposto.
+
+<b>Observação:</b> a retenção aqui é <b>não-acumulada</b> (cada célula conta só
+quem comprou <i>naquele</i> mês específico). Por isso os números não somam 100%
+entre colunas.
+
+</div>
+""", unsafe_allow_html=True)
 
     st.info(
         "Cohorts anteriores a mar/2024 foram omitidos — os primeiros meses da base "
@@ -1355,12 +1519,52 @@ elif painel == "Sazonalidade":
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PAINEL 4 — OPERACIONAL
+# PAINEL 4 — ESTRATÉGIA DE CARTEIRA
 # ═════════════════════════════════════════════════════════════════════════════
 
-elif painel == "Operacional":
+elif painel == "Estratégia de Carteira":
 
-    st.title("Painel Operacional")
+    st.title("Estratégia de Carteira")
+    st.caption(
+        "Decide onde investir atenção: quem manter, quem reativar, quem recuperar "
+        "e quem monitorar. Cruza o valor do cliente (score RFV) com o status atual."
+    )
+
+    # ── Box explicativo (escondido) ──────────────────────────────────────
+    with st.expander("Como funciona o score RFV e a matriz de ação", expanded=False):
+        st.markdown("""
+<div style='font-size:0.88rem; line-height:1.6; color:#333;'>
+
+<b>Score RFV</b> combina três dimensões que indicam o quanto um cliente está
+engajado com a empresa:
+
+<ul style='margin-top:6px; margin-bottom:10px;'>
+<li><b>Valor (peso 50%)</b> — quanto ele gasta por compra, comparado à média do segmento dele</li>
+<li><b>Frequência (peso 30%)</b> — quantas compras fez, comparado à mediana do segmento</li>
+<li><b>Recência (peso 20%)</b> — quanto tempo faz que comprou (mais recente = melhor)</li>
+</ul>
+
+Em Out–Dez, clientes com perfil sazonal ganham bônus de prioridade — é a janela
+natural de compra deles.
+
+O score é <b>relativo à carteira ativa atual</b> e separa os clientes em três camadas:
+<b>A — Alto valor (Top 5%)</b>, <b>B — Médio valor (6 a 20%)</b> e <b>C — Base (restante)</b>.
+
+<b>Matriz de ação</b> combina a camada RFV (linhas) com o status comercial (colunas).
+Cada célula corresponde a uma ação diferente:
+
+<ul style='margin-top:6px;'>
+<li><b>Manutenção</b> (clientes ativos) — cuidar para não perder, fidelizar</li>
+<li><b>Reativação</b> (em risco, 91–180 dias) — contato rápido, janela quente</li>
+<li><b>Recuperação</b> (hibernando, 181–365 dias) — abordagem estruturada</li>
+<li><b>Monitoramento</b> (perdidos, +365 dias) — avaliar se vale o esforço</li>
+</ul>
+
+A prioridade dentro de cada ação segue a camada: <b>A</b> é prioritária, <b>B</b> é
+padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
+
+</div>
+""", unsafe_allow_html=True)
 
     with st.expander("Definições de status de cliente", expanded=False):
         st.markdown("""
@@ -1373,175 +1577,300 @@ elif painel == "Operacional":
 </div>
 """, unsafe_allow_html=True)
 
-    # ── KPIs reativação ───────────────────────────────────────────────────
-    reat_d = seg(df_reat)
-    n_risco  = (reat_d["status_cliente"]=="em_risco").sum()
-    n_hibern = reat_d["status_cliente"].isin(["hibernando","hibernando_sazonal"]).sum()
-    n_perdid = (reat_d["status_cliente"]=="perdido").sum()
-    val_risco= reat_d[reat_d["status_cliente"]=="em_risco"]["valor_total_r"].sum()
+    # ── Calcula score RFV sobre TODA a carteira ativa ────────────────────
+    base_rfv = df_cart[df_cart["status_cliente"] != "sem_compra"].copy()
+    if seg_filter != "Todos":
+        base_rfv = base_rfv[base_rfv["segmento"] == seg_filter]
 
-    c1,c2,c3,c4 = st.columns(4)
-    with c1: st.metric("Em Risco",    fmt_num(n_risco),  help="91–180 dias sem comprar")
-    with c2: st.metric("Hibernando",  fmt_num(n_hibern), help="181–365 dias sem comprar")
-    with c3: st.metric("Perdidos",    fmt_num(n_perdid), help="Mais de 365 dias sem comprar")
-    with c4: st.metric("Valor histórico em risco", fmt_brl(val_risco, compact=True))
-
-    st.divider()
-
-    # ── Score RFV + carteira enriquecida ──────────────────────────────────
-    # Aplicado somente aos recuperáveis (em risco + hibernando sazonal/normal).
-    reat_alvos = reat_d[reat_d["status_cliente"].isin(
-        ["em_risco", "hibernando", "hibernando_sazonal"]
-    )].copy()
-
-    if not reat_alvos.empty:
-        saz_map = (
-            df_cart.drop_duplicates("nome_exibicao")
-            .set_index("nome_exibicao")["perfil_sazonalidade"]
-            .to_dict()
-        )
-        reat_alvos["perfil_sazonalidade"] = reat_alvos["nome_exibicao"].map(saz_map)
-        reat_alvos = calcular_score_reativacao(reat_alvos)
-
-    # ── Cartões das camadas A/B/C ─────────────────────────────────────────
-    st.subheader("Camadas por score RFV")
-    st.caption(
-        "Score = 0,5·Valor + 0,3·Frequência + 0,2·Recência invertida · "
-        "Modificador sazonal +0,2 para clientes sazonais em Out–Dez"
-    )
-
-    def _camada(df, rotulo):
-        sub = df[df["camada"] == rotulo] if "camada" in df.columns else df.head(0)
-        n = len(sub)
-        v = sub["valor_total_r"].sum() if n else 0
-        return sub, n, v
-
-    cam_a, n_a, v_a = _camada(reat_alvos, "A — Top 5%")
-    cam_b, n_b, v_b = _camada(reat_alvos, "B — 6-20%")
-    cam_c, n_c, v_c = _camada(reat_alvos, "C — restante")
-
-    CARD_CSS = (
-        "padding:14px 16px; border-radius:8px; border:1px solid #e0e0e0; "
-        "background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.04);"
-    )
-
-    def _card(col, titulo, n, v, cor_borda):
-        with col:
-            st.markdown(
-                f"<div style='{CARD_CSS} border-left:4px solid {cor_borda};'>"
-                f"<div style='font-size:0.78rem; color:#666; font-weight:600; "
-                f"text-transform:uppercase; letter-spacing:0.04em;'>{titulo}</div>"
-                f"<div style='font-size:1.45rem; font-weight:700; color:#111; "
-                f"margin-top:4px;'>{fmt_num(n)} clientes</div>"
-                f"<div style='font-size:0.9rem; color:#333; margin-top:2px;'>"
-                f"{fmt_brl(v, compact=True)} em valor histórico</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-    col_a, col_b, col_c = st.columns(3)
-    _card(col_a, "Camada A — Top 5%",   n_a, v_a, "#1A73E8")
-    _card(col_b, "Camada B — 6 a 20%",  n_b, v_b, "#F9AB00")
-    _card(col_c, "Camada C — restante", n_c, v_c, "#BDC1C6")
-
-    exp_a, exp_b, exp_c = st.columns(3)
-    with exp_a:
-        if n_a: botao_csv(cam_a, "reativacao_camada_A", "Baixar Camada A", key="csv_cam_a")
-    with exp_b:
-        if n_b: botao_csv(cam_b, "reativacao_camada_B", "Baixar Camada B", key="csv_cam_b")
-    with exp_c:
-        if n_c: botao_csv(cam_c, "reativacao_camada_C", "Baixar Camada C", key="csv_cam_c")
-
-    st.divider()
-
-    # ── Lista de reativação ───────────────────────────────────────────────
-    st.subheader("Lista de clientes para reativação")
-
-    # Enriquece com vendedor predominante (por nº de vendas fechadas),
-    # que é mais útil operacionalmente do que o representante fixo do cadastro.
     vend_map = (
         df_cart[["id", "nome_exibicao"]]
         .merge(df_cli_vend, left_on="id", right_on="cliente_id", how="inner")
         .drop_duplicates("nome_exibicao")
         .set_index("nome_exibicao")["vendedor_principal"]
     )
-    reat_d = reat_d.copy()
-    reat_d["vendedor"] = reat_d["nome_exibicao"].map(vend_map)
 
-    f1,f2,f3 = st.columns(3)
-    with f1:
-        st_sel = st.multiselect(
-            "Status", ["em_risco","hibernando","hibernando_sazonal","perdido"],
-            default=["em_risco","hibernando_sazonal"],
+    if base_rfv.empty:
+        st.info("Sem clientes na carteira ativa para o filtro atual.")
+        st.stop()
+
+    base_rfv = calcular_score_rfv(base_rfv)
+    base_rfv["vendedor"] = base_rfv["nome_exibicao"].map(vend_map)
+
+    # ── KPIs de topo ─────────────────────────────────────────────────────
+    n_total     = len(base_rfv)
+    val_total   = base_rfv["valor_total_r"].sum()
+    fora_ativo  = base_rfv[base_rfv["status_cliente"] != "ativo"]
+    val_risco   = fora_ativo["valor_total_r"].sum()
+    n_risco     = len(fora_ativo)
+    pct_val_risco = (val_risco / val_total * 100) if val_total else 0
+
+    # Valor histórico concentrado em Camada A (patrimônio sensível)
+    val_cam_a   = base_rfv[base_rfv["camada"] == "A — Alto valor"]["valor_total_r"].sum()
+    pct_cam_a   = (val_cam_a / val_total * 100) if val_total else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Clientes ativos na base", fmt_num(n_total))
+    with c2: st.metric("Valor histórico total", fmt_brl(val_total, compact=True))
+    with c3:
+        st.metric(
+            "Patrimônio fora de ativo",
+            fmt_brl(val_risco, compact=True),
+            delta=f"{pct_val_risco:.0f}% da carteira".replace(".", ","),
+            delta_color="inverse",
+            help="Valor histórico acumulado dos clientes em risco, hibernando ou perdidos",
         )
-    with f2:
-        ufs = ["Todos"] + sorted(reat_d["uf"].dropna().unique().tolist())
-        uf_sel = st.selectbox("UF", ufs)
-    with f3:
-        vend_opts = ["Todos"] + sorted(reat_d["vendedor"].dropna().unique().tolist())
-        vend_sel = st.selectbox("Vendedor", vend_opts)
-
-    reat_f = reat_d[reat_d["status_cliente"].isin(st_sel)]
-    if uf_sel   != "Todos": reat_f = reat_f[reat_f["uf"]==uf_sel]
-    if vend_sel != "Todos": reat_f = reat_f[reat_f["vendedor"]==vend_sel]
-
-    reat_f = reat_f.copy()
-    if not reat_alvos.empty and "score" in reat_alvos.columns:
-        score_map = (
-            reat_alvos.drop_duplicates("nome_exibicao")
-            .set_index("nome_exibicao")[["score", "camada"]]
+    with c4:
+        st.metric(
+            "Concentração na Camada A",
+            f"{pct_cam_a:.0f}%".replace(".", ","),
+            help="% do valor histórico concentrado nos Top 5% de clientes",
         )
-        reat_f = reat_f.join(score_map, on="nome_exibicao")
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # HERO · Matriz de ação (Camada RFV × Status)
+    # ═══════════════════════════════════════════════════════════════════════
+    st.subheader("Matriz de ação — camada × status")
+
+    CAMADAS_ORD = ["A — Alto valor", "B — Médio valor", "C — Base"]
+    STATUS_ORD  = ["ativo", "em_risco", "hibernando", "hibernando_sazonal", "perdido"]
+    STATUS_LBL  = {
+        "ativo":              "Ativo",
+        "em_risco":           "Em Risco",
+        "hibernando":         "Hibernando",
+        "hibernando_sazonal": "Hibern. Sazonal",
+        "perdido":            "Perdido",
+    }
+    # Agrupa Hibernando + Hibern. Sazonal na mesma coluna da matriz (ação idêntica)
+    base_rfv["status_matriz"] = base_rfv["status_cliente"].replace(
+        {"hibernando_sazonal": "hibernando"}
+    )
+    STATUS_MATRIZ = ["ativo", "em_risco", "hibernando", "perdido"]
+    STATUS_MATRIZ_LBL = {
+        "ativo":      "Ativo",
+        "em_risco":   "Em Risco",
+        "hibernando": "Hibernando",
+        "perdido":    "Perdido",
+    }
+    # Rótulos estratégicos (camada, status) → ação
+    ACAO_MATRIZ = {
+        ("A — Alto valor",  "ativo"):      "Manutenção prioritária",
+        ("A — Alto valor",  "em_risco"):   "Reativação prioritária",
+        ("A — Alto valor",  "hibernando"): "Recuperação prioritária",
+        ("A — Alto valor",  "perdido"):    "Ex-estratégicos",
+        ("B — Médio valor", "ativo"):      "Manutenção",
+        ("B — Médio valor", "em_risco"):   "Reativação",
+        ("B — Médio valor", "hibernando"): "Recuperação",
+        ("B — Médio valor", "perdido"):    "Perdidos relevantes",
+        ("C — Base",        "ativo"):      "Monitoramento",
+        ("C — Base",        "em_risco"):   "Atenção",
+        ("C — Base",        "hibernando"): "Baixa prioridade",
+        ("C — Base",        "perdido"):    "Baixa prioridade",
+    }
+    CORES_MATRIZ = {
+        ("A — Alto valor",  "ativo"):      "#0d47a1",
+        ("A — Alto valor",  "em_risco"):   "#b00020",
+        ("A — Alto valor",  "hibernando"): "#d84315",
+        ("A — Alto valor",  "perdido"):    "#5f6368",
+        ("B — Médio valor", "ativo"):      "#1A73E8",
+        ("B — Médio valor", "em_risco"):   "#E8453C",
+        ("B — Médio valor", "hibernando"): "#F9AB00",
+        ("B — Médio valor", "perdido"):    "#80868B",
+        ("C — Base",        "ativo"):      "#80cbc4",
+        ("C — Base",        "em_risco"):   "#ffcc80",
+        ("C — Base",        "hibernando"): "#e0e0e0",
+        ("C — Base",        "perdido"):    "#bdbdbd",
+    }
+
+    # ── Constrói a grade CSS 3×4 com contagem + valor por célula ──────────
+    if "celula_selecionada" not in st.session_state:
+        st.session_state["celula_selecionada"] = None
+
+    # Header: status
+    header_cols = st.columns([1.3] + [1] * len(STATUS_MATRIZ))
+    with header_cols[0]:
+        st.markdown(
+            "<div style='font-size:0.75rem; color:#888; font-weight:600; "
+            "text-transform:uppercase; letter-spacing:0.06em; padding:4px 0;'>"
+            "Camada ↓ &nbsp;/&nbsp; Status →</div>",
+            unsafe_allow_html=True,
+        )
+    for i, sx in enumerate(STATUS_MATRIZ):
+        with header_cols[i + 1]:
+            st.markdown(
+                f"<div style='text-align:center; font-size:0.82rem; font-weight:600; "
+                f"color:#222; padding:4px 0; border-bottom:1px solid #eee;'>"
+                f"{STATUS_MATRIZ_LBL[sx]}</div>",
+                unsafe_allow_html=True,
+            )
+
+    # Linhas da matriz
+    for cam in CAMADAS_ORD:
+        row = st.columns([1.3] + [1] * len(STATUS_MATRIZ))
+        with row[0]:
+            cor_cam = {"A — Alto valor": "#1A73E8",
+                       "B — Médio valor": "#F9AB00",
+                       "C — Base": "#BDC1C6"}[cam]
+            st.markdown(
+                f"<div style='padding:22px 10px 0 0; text-align:right; "
+                f"border-right:4px solid {cor_cam};'>"
+                f"<div style='font-size:0.88rem; font-weight:700; color:#222;'>{cam}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        for i, sx in enumerate(STATUS_MATRIZ):
+            with row[i + 1]:
+                sub = base_rfv[
+                    (base_rfv["camada"] == cam) & (base_rfv["status_matriz"] == sx)
+                ]
+                n = len(sub)
+                v = sub["valor_total_r"].sum()
+                acao = ACAO_MATRIZ[(cam, sx)]
+                cor = CORES_MATRIZ[(cam, sx)]
+                selecionado = st.session_state["celula_selecionada"] == (cam, sx)
+                borda = "2px solid #111" if selecionado else "1px solid #e0e0e0"
+                bg    = "#fff"
+                opacidade_barra = "0.12"
+
+                st.markdown(
+                    f"""<div style='position:relative; padding:12px 12px; border:{borda};
+                        border-radius:6px; background:{bg}; min-height:96px;
+                        margin-bottom:2px; overflow:hidden;'>
+<div style='position:absolute; top:0; left:0; right:0; height:3px; background:{cor};'></div>
+<div style='font-size:0.72rem; color:#666; font-weight:600; text-transform:uppercase;
+    letter-spacing:0.03em; margin-top:2px;'>{acao}</div>
+<div style='font-size:1.35rem; font-weight:700; color:#111; line-height:1.1; margin-top:4px;'>
+    {fmt_num(n)}</div>
+<div style='font-size:0.78rem; color:#555; margin-top:2px;'>
+    {fmt_brl(v, compact=True)}</div>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+
+                if n > 0:
+                    key_btn = f"sel_{cam}_{sx}".replace(" ", "_").replace("—", "d")
+                    if st.button(
+                        "Filtrar fila ↓" if not selecionado else "✓ selecionado",
+                        key=key_btn, use_container_width=True,
+                    ):
+                        if selecionado:
+                            st.session_state["celula_selecionada"] = None
+                        else:
+                            st.session_state["celula_selecionada"] = (cam, sx)
+                        st.rerun()
+
+    # Botão para limpar seleção
+    if st.session_state["celula_selecionada"] is not None:
+        if st.button("Limpar seleção da matriz", key="limpar_matriz"):
+            st.session_state["celula_selecionada"] = None
+            st.rerun()
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Fila detalhada — filtrada por célula (se houver) + filtros auxiliares
+    # ═══════════════════════════════════════════════════════════════════════
+    sel = st.session_state["celula_selecionada"]
+    if sel:
+        cam_sel, st_sel_cell = sel
+        acao_sel = ACAO_MATRIZ[sel]
+        st.subheader(f"Fila · {acao_sel}")
+        st.caption(
+            f"Filtrado pela matriz: **{cam_sel}** × **{STATUS_MATRIZ_LBL[st_sel_cell]}**"
+        )
     else:
-        reat_f["score"]  = pd.NA
-        reat_f["camada"] = pd.NA
+        st.subheader("Fila completa — carteira ativa")
+        st.caption("Toda a base ativa ordenada por score RFV. Clique em uma "
+                   "célula da matriz para filtrar.")
 
-    reat_f = reat_f.sort_values("score", ascending=False, na_position="last")
+    fila = base_rfv.copy()
+    if sel:
+        cam_sel, st_sel_cell = sel
+        fila = fila[
+            (fila["camada"] == cam_sel) & (fila["status_matriz"] == st_sel_cell)
+        ]
 
-    reat_f["Fat. Total"]    = reat_f["valor_total_r"].apply(fmt_brl)
-    reat_f["Ticket Medio"]  = reat_f["ticket_medio_r"].apply(fmt_brl)
-    reat_f["Ultima Compra"] = reat_f["ultima_compra"].dt.strftime("%d/%m/%Y")
-    reat_f["Status"]        = reat_f["status_cliente"].map(LABEL_STATUS)
-    reat_f["Score"]         = reat_f["score"].apply(
-        lambda v: f"{float(v):.2f}".replace(".", ",") if pd.notna(v) else "—"
-    )
-    reat_f["Camada"]        = reat_f["camada"].astype("object").fillna("—")
+    # Filtros secundários
+    f1, f2 = st.columns(2)
+    with f1:
+        ufs_opts = ["Todos"] + sorted(fila["uf"].dropna().unique().tolist())
+        uf_sel = st.selectbox("UF", ufs_opts, key="fila_uf")
+    with f2:
+        vend_opts = ["Todos"] + sorted(fila["vendedor"].dropna().unique().tolist())
+        vend_sel = st.selectbox("Vendedor", vend_opts, key="fila_vend")
 
-    def _bg(val):
-        m={"Em Risco":"background-color:#fff3cd","Hibernando":"background-color:#ffe0b2",
-           "Perdido":"background-color:#f8d7da","Hibern. Sazonal":"background-color:#ffe0b2"}
-        return m.get(val,"")
+    if uf_sel != "Todos":
+        fila = fila[fila["uf"] == uf_sel]
+    if vend_sel != "Todos":
+        fila = fila[fila["vendedor"] == vend_sel]
 
-    def _bg_cam(val):
-        m={"A — Top 5%":"background-color:#d2e3fc;color:#0d47a1;font-weight:600",
-           "B — 6-20%":"background-color:#fff3cd;color:#856404",
-           "C — restante":"background-color:#f1f3f4;color:#555"}
-        return m.get(str(val),"")
+    fila = fila.sort_values("score", ascending=False)
 
-    exib_r = reat_f.rename(columns={
-        "nome_exibicao":"Cliente","segmento":"Segmento","cidade":"Cidade","uf":"UF",
-        "vendedor":"Vendedor","total_compras":"Compras",
-        "dias_sem_compra":"Dias s/comprar",
-    })[["Cliente","Segmento","Cidade","UF","Vendedor","Status","Camada","Score",
-        "Ultima Compra","Dias s/comprar","Compras","Fat. Total","Ticket Medio"]]
-    exib_r["Vendedor"] = exib_r["Vendedor"].fillna("—")
+    if fila.empty:
+        st.info("Sem clientes para os filtros atuais.")
+    else:
+        exib = fila.copy()
+        exib["Fat. Total"]    = exib["valor_total_r"].apply(fmt_brl)
+        exib["Ticket Medio"]  = exib["ticket_medio_r"].apply(fmt_brl)
+        exib["Ult. Compra"]   = exib["ultima_compra"].dt.strftime("%d/%m/%Y")
+        exib["Status"]        = exib["status_cliente"].map(LABEL_STATUS)
+        exib["Score"]         = exib["score"].apply(
+            lambda v: f"{float(v):.2f}".replace(".", ",") if pd.notna(v) else "—"
+        )
+        exib["Camada"] = exib["camada"].astype("object").fillna("—")
+        exib["Vendedor"] = exib["vendedor"].fillna("—")
+        exib = exib.rename(columns={
+            "nome_exibicao": "Cliente",
+            "segmento": "Segmento",
+            "cidade": "Cidade",
+            "uf": "UF",
+            "total_compras": "Compras",
+            "dias_sem_compra": "Dias s/comprar",
+        })[["Cliente", "Segmento", "Cidade", "UF", "Vendedor",
+            "Status", "Camada", "Score", "Ult. Compra",
+            "Dias s/comprar", "Compras", "Fat. Total", "Ticket Medio"]]
 
-    st.dataframe(
-        exib_r.style.map(_bg, subset=["Status"]).map(_bg_cam, subset=["Camada"]),
-        use_container_width=True, height=460, hide_index=True,
-    )
-    n_str = f"{len(exib_r):,}".replace(",", ".")
-    st.caption(
-        f"{n_str} clientes exibidos · Vendedor = funcionário/vendedor "
-        "predominante (maior nº de vendas fechadas)"
-    )
+        def _bg_status(val):
+            m = {
+                "Em Risco":         "background-color:#fff3cd",
+                "Hibernando":       "background-color:#ffe0b2",
+                "Perdido":          "background-color:#f8d7da",
+                "Hibern. Sazonal":  "background-color:#ffe0b2",
+                "Ativo":            "background-color:#d4edda",
+            }
+            return m.get(val, "")
 
-    botao_csv(
-        reat_f[["nome_exibicao","segmento","cidade","uf","vendedor",
-                "status_cliente","camada","score","ultima_compra","dias_sem_compra",
-                "total_compras","valor_total_r","ticket_medio_r"]],
-        "reativacao_camboriu", "Exportar lista (CSV)", key="csv_reat_full",
-    )
+        def _bg_cam(val):
+            m = {
+                "A — Alto valor":  "background-color:#d2e3fc;color:#0d47a1;font-weight:600",
+                "B — Médio valor": "background-color:#fff3cd;color:#856404",
+                "C — Base":        "background-color:#f1f3f4;color:#555",
+            }
+            return m.get(str(val), "")
+
+        st.dataframe(
+            exib.style.map(_bg_status, subset=["Status"]).map(_bg_cam, subset=["Camada"]),
+            use_container_width=True, height=460, hide_index=True,
+        )
+        n_str = f"{len(exib):,}".replace(",", ".")
+        val_fila = fila["valor_total_r"].sum()
+        st.caption(
+            f"{n_str} clientes · {fmt_brl(val_fila, compact=True)} em valor histórico "
+            "· Vendedor = funcionário/vendedor predominante por nº de vendas fechadas"
+        )
+
+        csv_nome = "fila_estrategia"
+        if sel:
+            csv_nome = ("fila_" + ACAO_MATRIZ[sel]
+                        .lower().replace(" ", "_").replace("ã","a").replace("é","e"))
+        botao_csv(
+            fila[["nome_exibicao", "segmento", "cidade", "uf", "vendedor",
+                  "status_cliente", "camada", "score", "ultima_compra",
+                  "dias_sem_compra", "total_compras",
+                  "valor_total_r", "ticket_medio_r"]],
+            csv_nome, "Exportar fila (CSV)", key="csv_fila_estrat",
+        )
 
     st.divider()
 
@@ -1552,24 +1881,27 @@ elif painel == "Operacional":
         (hoje - df_cart["primeira_compra"]).dt.days <= 60
     ].copy()
     if seg_filter != "Todos":
-        novos60 = novos60[novos60["segmento"]==seg_filter]
+        novos60 = novos60[novos60["segmento"] == seg_filter]
     novos60 = novos60.sort_values("valor_total_r", ascending=False)
     novos60["Fat. Total"]   = novos60["valor_total_r"].apply(fmt_brl)
     novos60["Ticket Medio"] = novos60["ticket_medio_r"].apply(fmt_brl)
     novos60["1a Compra"]    = novos60["primeira_compra"].dt.strftime("%d/%m/%Y")
 
     exib_novos = novos60.rename(
-        columns={"nome_exibicao":"Cliente","total_compras":"Compras"}
-    )[["Cliente","segmento","cidade","uf","1a Compra","Compras","Fat. Total","Ticket Medio"]]
+        columns={"nome_exibicao": "Cliente", "total_compras": "Compras"}
+    )[["Cliente", "segmento", "cidade", "uf", "1a Compra",
+       "Compras", "Fat. Total", "Ticket Medio"]]
 
-    st.dataframe(exib_novos, use_container_width=True, height=300, hide_index=True)
-    st.caption(f"{len(novos60):,} novos clientes nos últimos 60 dias".replace(",","."))
+    st.dataframe(exib_novos, use_container_width=True, height=280, hide_index=True)
+    n_novos = f"{len(novos60):,}".replace(",", ".")
+    st.caption(f"{n_novos} novos clientes nos últimos 60 dias")
     if not novos60.empty:
         botao_csv(exib_novos, "novos_clientes_60d", key="csv_novos60")
 
-    st.divider()
-
-    st.caption("Para análise completa de performance por vendedor, acesse o painel **Vendedores**.")
+    st.caption(
+        "Para análise de performance dos vendedores sobre esses clientes, "
+        "acesse o painel **Vendedores**."
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1853,11 +2185,11 @@ elif painel == "Vendedores":
         ag = (recup.groupby(["vendedor_principal", "camada"], as_index=False)
               .agg(n_cli=("id", "count"), valor=("valor_total_r", "sum")))
 
-        CAMADAS = ["A — Top 5%", "B — 6-20%", "C — restante"]
+        CAMADAS = ["A — Alto valor", "B — Médio valor", "C — Base"]
         CORES_CAM = {
-            "A — Top 5%":   "#1A73E8",
-            "B — 6-20%":    "#F9AB00",
-            "C — restante": "#BDC1C6",
+            "A — Alto valor":  "#1A73E8",
+            "B — Médio valor": "#F9AB00",
+            "C — Base":        "#BDC1C6",
         }
 
         # Pivota para ter colunas por camada (tanto contagem quanto valor)
@@ -1876,7 +2208,8 @@ elif painel == "Vendedores":
 
         # Ordem de prioridade: primeiro quem tem mais Camada A; depois B; depois C.
         ordem = piv_n.sort_values(
-            by=["A — Top 5%", "B — 6-20%", "Total"], ascending=[False, False, False]
+            by=["A — Alto valor", "B — Médio valor", "Total"],
+            ascending=[False, False, False],
         )
         top_n = 15
         ordem_top = ordem.head(top_n).index.tolist()
@@ -1924,7 +2257,7 @@ elif painel == "Vendedores":
             # KPI agregado + tabela lado a lado (Top 5 por Camada A)
             total_recup   = int(piv_n["Total"].sum())
             total_valor   = float(piv_v["Valor"].sum())
-            total_cam_a   = int(piv_n["A — Top 5%"].sum())
+            total_cam_a   = int(piv_n["A — Alto valor"].sum())
 
             k1, k2 = st.columns(2)
             with k1:
@@ -1940,7 +2273,7 @@ elif painel == "Vendedores":
             tabela["Valor hist."] = tabela["Valor"].apply(lambda v: fmt_brl(v, compact=True))
             tabela = tabela.reset_index().rename(columns={
                 "vendedor_principal": "Vendedor",
-                "A — Top 5%": "A", "B — 6-20%": "B", "C — restante": "C",
+                "A — Alto valor": "A", "B — Médio valor": "B", "C — Base": "C",
             })[["Vendedor", "A", "B", "C", "Total", "Valor hist."]]
             st.caption(f"Top {len(tabela)} por concentração de Camada A")
             st.dataframe(tabela, use_container_width=True, hide_index=True, height=380)
