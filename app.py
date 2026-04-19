@@ -10,7 +10,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import psycopg2
+import re
 from datetime import date, timedelta
+from html import unescape
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -25,7 +27,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_URL = st.secrets.get("DB_URL", "")  # configure em .streamlit/secrets.toml
+DB_URL        = st.secrets.get("DB_URL", "")         # conexão direta (IPv6 em alguns ambientes)
+DB_URL_POOLER = st.secrets.get("DB_URL_POOLER", "")  # Session Pooler IPv4 — preferido
+_CONN_URL     = DB_URL_POOLER or DB_URL               # usa pooler se disponível
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Autenticação simples
@@ -59,11 +63,12 @@ if not _check_password():
 
 # ── Teste de conexão (diagnóstico — remover depois de funcionar) ────────────
 try:
-    _test_conn = psycopg2.connect(DB_URL, connect_timeout=10)
+    _test_conn = psycopg2.connect(_CONN_URL, connect_timeout=10)
     _test_conn.close()
 except Exception as _e:
     st.error(f"Erro de conexão: **{type(_e).__name__}** — {_e}")
-    st.info(f"DB_URL tem {len(DB_URL)} caracteres. Começa com: `{DB_URL[:25]}...`")
+    _shown = _CONN_URL[:25] if _CONN_URL else "(vazio)"
+    st.info(f"URL usada tem {len(_CONN_URL)} caracteres. Começa com: `{_shown}...`")
     st.stop()
 
 # ── Fonte e estilos ───────────────────────────────────────────────────────────
@@ -253,38 +258,102 @@ def aplicar_periodo(df: pd.DataFrame, periodo: str, col: str) -> pd.DataFrame:
         return df[df[col].dt.year == (hoje.year - 1)]
     return df
 
+
+def limpar_descricao_item(valor) -> str:
+    """Remove HTML/ruído do item e preserva um nome curto legível."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return "Sem descrição"
+    texto = unescape(str(valor))
+    texto = re.sub(r"<[^>]+>", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    texto = re.sub(r"\s*\(Ref\.[^)]+\)", "", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"\s*REF:\s*[A-Z0-9\-\/]+\s*$", "", texto, flags=re.IGNORECASE)
+    return texto or "Sem descrição"
+
+
+def faixa_preco_item(valor: float | int | None) -> str:
+    if valor is None or pd.isna(valor):
+        return "Sem preço"
+    v = float(valor)
+    if v < 50:
+        return "Até R$ 49"
+    if v < 100:
+        return "R$ 50–99"
+    if v < 150:
+        return "R$ 100–149"
+    if v < 200:
+        return "R$ 150–199"
+    return "R$ 200+"
+
+
+CORES_PRIORIDADE = {
+    "Alta":  "#c0392b",
+    "Média": "#b7791f",
+    "Baixa": "#9aa0a6",
+}
+
+
+def calcular_gap_medio_segmento(df: pd.DataFrame) -> pd.Series:
+    """Gap mediano entre compras por segmento, com fallback global."""
+    if df.empty:
+        return pd.Series(dtype=float)
+    idade_rel = (df["ultima_compra"] - df["primeira_compra"]).dt.days.clip(lower=0)
+    gap_cliente = idade_rel / (df["total_compras"] - 1).replace(0, pd.NA)
+    gap_seg = gap_cliente.groupby(df["segmento"]).transform("median")
+    gap_geral = gap_cliente.median()
+    if pd.isna(gap_geral) or gap_geral <= 0:
+        gap_geral = 45.0
+    return gap_seg.fillna(gap_geral).clip(lower=15, upper=180)
+
+
+def classificar_janela_segunda_compra(dias_desde_primeira) -> str:
+    if dias_desde_primeira is None or pd.isna(dias_desde_primeira):
+        return "Sem data"
+    dias = float(dias_desde_primeira)
+    if dias <= 14:
+        return "Ainda cedo"
+    if dias <= 60:
+        return "Janela ideal"
+    if dias <= 120:
+        return "Atrasada"
+    return "Esfriando"
+
+
+def classificar_momento_expansao(dias_sem_compra, gap_medio_segmento) -> str:
+    if dias_sem_compra is None or pd.isna(dias_sem_compra):
+        return "Sem histórico"
+    gap = gap_medio_segmento if pd.notna(gap_medio_segmento) and gap_medio_segmento > 0 else 45
+    razao = float(dias_sem_compra) / float(gap)
+    if razao < 0.75:
+        return "Ainda no ciclo"
+    if razao <= 1.35:
+        return "Janela quente"
+    if razao <= 2.00:
+        return "Pede ação"
+    return "Esfriando"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conexão e cache
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner=False)
-def get_conn():
-    if not DB_URL:
+def _new_conn():
+    if not _CONN_URL:
         st.error("DB_URL vazio — configure em Settings → Secrets no Streamlit Cloud.")
         st.stop()
-    try:
-        return psycopg2.connect(DB_URL, connect_timeout=10)
-    except Exception as e:
-        # Mostra o tipo do erro sem expor a connection string
-        st.error(f"Falha na conexão com o banco: {type(e).__name__}: {e}")
-        st.info(f"DB_URL presente: {'sim' if DB_URL else 'não'} | tamanho: {len(DB_URL)} chars")
-        st.stop()
+    return psycopg2.connect(_CONN_URL, connect_timeout=15,
+                            options="-c statement_timeout=60000")
 
 
 def qry(sql):
-    conn = get_conn()
+    conn = _new_conn()
     try:
         with conn.cursor() as c:
             c.execute(sql)
             cols = [d[0] for d in c.description]
             return pd.DataFrame(c.fetchall(), columns=cols)
-    except Exception:
-        st.cache_resource.clear()
-        conn2 = psycopg2.connect(DB_URL)
-        with conn2.cursor() as c:
-            c.execute(sql)
-            cols = [d[0] for d in c.description]
-            return pd.DataFrame(c.fetchall(), columns=cols)
+    finally:
+        conn.close()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -401,6 +470,100 @@ def load_vendedores():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_carteira_demo():
+    """Carteira com campos extras para o painel Demografia (requer migração 002)."""
+    df = qry("""
+        SELECT id, nome_exibicao, segmento, segmento_atual,
+               tipo_pessoa, documento_tipo, grupo_cadastrado,
+               cidade, uf, primeira_compra, ultima_compra,
+               valor_total_r::float, ticket_medio_r::float,
+               total_compras, dias_sem_compra, status_cliente
+        FROM vw_ls_carteira
+    """)
+    df["primeira_compra"] = pd.to_datetime(df["primeira_compra"], errors="coerce")
+    df["ultima_compra"]   = pd.to_datetime(df["ultima_compra"],   errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_carteira_geo_cached():
+    """Carteira enriquecida com lat/lon IBGE e distância até a sede."""
+    from geo import enriquecer_carteira_geo
+    return enriquecer_carteira_geo(load_carteira_demo())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_vendas_geo():
+    """Vendas mensais por cidade para análise geográfica-temporal."""
+    df = qry("""
+        SELECT
+            DATE_TRUNC('month', fv.data_venda)::date         AS mes,
+            dc.cidade_norm                                    AS cidade,
+            dc.estado_norm                                    AS uf,
+            COALESCE(fv.tabela_preco, 'Sem Segmento')        AS segmento,
+            COUNT(fv.id)                                      AS qtd_vendas,
+            ROUND(SUM(fv.valor_total_liquido)::numeric/100,2)::float AS valor_r,
+            ROUND(AVG(fv.valor_total_liquido)::numeric/100,2)::float AS ticket_medio_r
+        FROM fato_vendas fv
+        JOIN dim_clientes dc ON dc.id = fv.cliente_id
+        WHERE fv.status_venda IN ('Fechada','Fechado')
+          AND fv.data_venda IS NOT NULL
+          AND dc.cidade_norm IS NOT NULL
+        GROUP BY 1, 2, 3, 4
+        ORDER BY 1
+    """)
+    df["mes"] = pd.to_datetime(df["mes"])
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_itens_clientes():
+    """Itens vendidos com atributos do cliente para análises de mix/produto."""
+    df = qry("""
+        SELECT
+            fi.id                                            AS item_id,
+            fi.origem,
+            fi.sistema_venda_id,
+            fi.sistema_item_id,
+            fi.sku,
+            fi.referencia,
+            fi.descricao_produto,
+            fi.quantidade::float                             AS quantidade,
+            fi.preco_unitario::float                         AS preco_unitario_r,
+            fi.valor_total_item::float                       AS valor_total_item_r,
+            fv.data_venda,
+            fv.status_venda,
+            COALESCE(vc.segmento, fv.tabela_preco, 'Sem Segmento') AS segmento,
+            fv.cliente_id,
+            vc.nome_exibicao,
+            dc.grupo_cadastrado,
+            vc.cidade,
+            vc.uf,
+            vc.status_cliente,
+            vc.total_compras,
+            vc.valor_total_r::float                          AS cliente_ltv_r,
+            vc.ticket_medio_r::float                         AS cliente_ticket_medio_r
+        FROM fato_itens_venda fi
+        LEFT JOIN fato_vendas fv
+               ON fv.id = fi.venda_id
+        LEFT JOIN vw_ls_carteira vc
+               ON vc.id = fv.cliente_id
+        LEFT JOIN dim_clientes dc
+               ON dc.id = fv.cliente_id
+        ORDER BY fv.data_venda DESC NULLS LAST, fi.id DESC
+    """)
+    if df.empty:
+        return df
+    df["data_venda"] = pd.to_datetime(df["data_venda"], errors="coerce")
+    for c in ["quantidade", "preco_unitario_r", "valor_total_item_r",
+              "cliente_ltv_r", "cliente_ticket_medio_r"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["produto"] = df["descricao_produto"].map(limpar_descricao_item)
+    df["faixa_preco_item"] = df["preco_unitario_r"].map(faixa_preco_item)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_orfas():
     df = qry("""
         SELECT
@@ -511,8 +674,8 @@ def load_cohort_segmento():
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 
-PAINEIS = ["Executivo", "Recorrência", "Sazonalidade", "Estratégia de Carteira", "Vendedores",
-           "Qualidade de Dados"]
+PAINEIS = ["Executivo", "Recorrência", "Sazonalidade", "Estratégia de Carteira",
+           "Demografia", "Itens", "Vendedores", "Qualidade de Dados"]
 
 if "painel" not in st.session_state:
     st.session_state["painel"] = "Executivo"
@@ -637,7 +800,7 @@ if painel == "Executivo":
     )
 
     # ── Cards de ação (navegação entre painéis) ──────────────────────────
-    ca1, ca2, ca3 = st.columns(3)
+    ca1, ca2, ca3, ca4 = st.columns(4)
     with ca1:
         if st.button("Top clientes para reativação →",
                      use_container_width=True, key="nav_reat"):
@@ -652,6 +815,11 @@ if painel == "Executivo":
         if st.button("Cohorts e retenção →",
                      use_container_width=True, key="nav_cohort"):
             st.session_state["_nav_target"] = "Recorrência"
+            st.rerun()
+    with ca4:
+        if st.button("Onde estão meus clientes →",
+                     use_container_width=True, key="nav_demo"):
+            st.session_state["_nav_target"] = "Demografia"
             st.rerun()
 
     st.divider()
@@ -932,11 +1100,11 @@ if painel == "Executivo":
 
         def cor_status(val):
             m = {
-                "Ativo":           "background-color:#d4edda;color:#155724",
-                "Em Risco":        "background-color:#fff3cd;color:#856404",
-                "Hibernando":      "background-color:#ffe0b2;color:#e65100",
-                "Perdido":         "background-color:#f8d7da;color:#721c24",
-                "Hibern. Sazonal": "background-color:#ffe0b2;color:#e65100",
+                "Ativo":           "background-color:#e8f1ea;color:#2f5d3b",
+                "Em Risco":        "background-color:#fbf3e0;color:#7a5a1f",
+                "Hibernando":      "background-color:#f5e7d8;color:#7a4b20",
+                "Perdido":         "background-color:#f2e3e2;color:#6b3a37",
+                "Hibern. Sazonal": "background-color:#f5e7d8;color:#7a4b20",
             }
             return m.get(val, "")
 
@@ -1530,53 +1698,6 @@ elif painel == "Estratégia de Carteira":
         "e quem monitorar. Cruza o valor do cliente (score RFV) com o status atual."
     )
 
-    # ── Box explicativo (escondido) ──────────────────────────────────────
-    with st.expander("Como funciona o score RFV e a matriz de ação", expanded=False):
-        st.markdown("""
-<div style='font-size:0.88rem; line-height:1.6; color:#333;'>
-
-<b>Score RFV</b> combina três dimensões que indicam o quanto um cliente está
-engajado com a empresa:
-
-<ul style='margin-top:6px; margin-bottom:10px;'>
-<li><b>Valor (peso 50%)</b> — quanto ele gasta por compra, comparado à média do segmento dele</li>
-<li><b>Frequência (peso 30%)</b> — quantas compras fez, comparado à mediana do segmento</li>
-<li><b>Recência (peso 20%)</b> — quanto tempo faz que comprou (mais recente = melhor)</li>
-</ul>
-
-Em Out–Dez, clientes com perfil sazonal ganham bônus de prioridade — é a janela
-natural de compra deles.
-
-O score é <b>relativo à carteira ativa atual</b> e separa os clientes em três camadas:
-<b>A — Alto valor (Top 5%)</b>, <b>B — Médio valor (6 a 20%)</b> e <b>C — Base (restante)</b>.
-
-<b>Matriz de ação</b> combina a camada RFV (linhas) com o status comercial (colunas).
-Cada célula corresponde a uma ação diferente:
-
-<ul style='margin-top:6px;'>
-<li><b>Manutenção</b> (clientes ativos) — cuidar para não perder, fidelizar</li>
-<li><b>Reativação</b> (em risco, 91–180 dias) — contato rápido, janela quente</li>
-<li><b>Recuperação</b> (hibernando, 181–365 dias) — abordagem estruturada</li>
-<li><b>Monitoramento</b> (perdidos, +365 dias) — avaliar se vale o esforço</li>
-</ul>
-
-A prioridade dentro de cada ação segue a camada: <b>A</b> é prioritária, <b>B</b> é
-padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
-
-</div>
-""", unsafe_allow_html=True)
-
-    with st.expander("Definições de status de cliente", expanded=False):
-        st.markdown("""
-<div class="nota-status">
-<b>Ativo</b> — última compra há menos de 90 dias<br>
-<b>Em Risco</b> — última compra entre 91 e 180 dias<br>
-<b>Hibernando</b> — última compra entre 181 e 365 dias<br>
-<b>Hibernando Sazonal</b> — cliente sazonal que comprou na última temporada mas não na atual<br>
-<b>Perdido</b> — última compra há mais de 365 dias
-</div>
-""", unsafe_allow_html=True)
-
     # ── Calcula score RFV sobre TODA a carteira ativa ────────────────────
     base_rfv = df_cart[df_cart["status_cliente"] != "sem_compra"].copy()
     if seg_filter != "Todos":
@@ -1608,6 +1729,13 @@ padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
     val_cam_a   = base_rfv[base_rfv["camada"] == "A — Alto valor"]["valor_total_r"].sum()
     pct_cam_a   = (val_cam_a / val_total * 100) if val_total else 0
 
+    # ── Snapshot da carteira ativa (KPIs neutros, contexto de tudo que vem) ──
+    st.markdown(
+        "<div style='font-size:0.72rem; font-weight:700; letter-spacing:0.1em; "
+        "text-transform:uppercase; color:#5f6368; margin:20px 0 4px;'>"
+        "Carteira ativa · snapshot atual</div>",
+        unsafe_allow_html=True,
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Clientes ativos na base", fmt_num(n_total))
     with c2: st.metric("Valor histórico total", fmt_brl(val_total, compact=True))
@@ -1625,13 +1753,76 @@ padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
             f"{pct_cam_a:.0f}%".replace(".", ","),
             help="% do valor histórico concentrado nos Top 5% de clientes",
         )
-
-    st.divider()
+    st.markdown(
+        "<div style='border-bottom:1px solid #e6e8eb; margin:8px 0 0;'></div>",
+        unsafe_allow_html=True,
+    )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # HERO · Matriz de ação (Camada RFV × Status)
+    # BLOCO 1 · DEFENDER A CARTEIRA (matriz RFV × status)
     # ═══════════════════════════════════════════════════════════════════════
-    st.subheader("Matriz de ação — camada × status")
+    st.markdown(
+        "<div style='margin:32px 0 16px; padding:14px 18px; background:#fff; "
+        "border-left:4px solid #1A73E8; border-top:1px solid #eef0f2; "
+        "border-right:1px solid #eef0f2; border-bottom:1px solid #eef0f2; "
+        "border-radius:4px;'>"
+        "<div style='font-size:0.7rem; font-weight:700; letter-spacing:0.12em; "
+        "text-transform:uppercase; color:#1A73E8;'>Bloco 1 · Proteger e reativar</div>"
+        "<div style='font-size:1.35rem; font-weight:700; margin-top:2px; line-height:1.2; color:#111;'>"
+        "Carteira atual</div>"
+        "<div style='font-size:0.88rem; color:#5f6368; margin-top:2px;'>"
+        "Receita que já existe e risco de fuga.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Metodologia: score RFV, status e matriz de ação", expanded=False):
+        st.markdown("""
+<div style='font-size:0.88rem; line-height:1.6; color:#333;'>
+
+<b>Score RFV</b> combina três dimensões que indicam o quanto um cliente está
+engajado com a empresa:
+
+<ul style='margin-top:6px; margin-bottom:10px;'>
+<li><b>Valor (peso 50%)</b> — quanto ele gasta por compra, comparado à média do segmento dele</li>
+<li><b>Frequência (peso 30%)</b> — quantas compras fez, comparado à mediana do segmento</li>
+<li><b>Recência (peso 20%)</b> — quanto tempo faz que comprou (mais recente = melhor)</li>
+</ul>
+
+Em Out–Dez, clientes com perfil sazonal ganham bônus de prioridade — é a janela
+natural de compra deles.
+
+O score é <b>relativo à carteira ativa atual</b> e separa os clientes em três camadas:
+<b>A — Alto valor (Top 5%)</b>, <b>B — Médio valor (6 a 20%)</b> e <b>C — Base (restante)</b>.
+
+<div style='margin-top:14px; padding-top:10px; border-top:1px solid #eee;'>
+<b>Status de cliente</b> (baseado na recência da última compra):
+<ul style='margin-top:6px; margin-bottom:10px;'>
+<li><b>Ativo</b> — última compra há menos de 90 dias</li>
+<li><b>Em Risco</b> — última compra entre 91 e 180 dias</li>
+<li><b>Hibernando</b> — última compra entre 181 e 365 dias</li>
+<li><b>Hibernando Sazonal</b> — cliente sazonal que comprou na última temporada mas não na atual</li>
+<li><b>Perdido</b> — última compra há mais de 365 dias</li>
+</ul>
+</div>
+
+<div style='margin-top:14px; padding-top:10px; border-top:1px solid #eee;'>
+<b>Matriz de ação</b> combina a camada RFV (linhas) com o status comercial (colunas).
+Cada célula corresponde a uma ação diferente:
+
+<ul style='margin-top:6px;'>
+<li><b>Manutenção</b> (clientes ativos) — cuidar para não perder, fidelizar</li>
+<li><b>Reativação</b> (em risco, 91–180 dias) — contato rápido, janela quente</li>
+<li><b>Recuperação</b> (hibernando, 181–365 dias) — abordagem estruturada</li>
+<li><b>Monitoramento</b> (perdidos, +365 dias) — avaliar se vale o esforço</li>
+</ul>
+
+A prioridade dentro de cada ação segue a camada: <b>A</b> é prioritária, <b>B</b> é
+padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
+</div>
+
+</div>
+""", unsafe_allow_html=True)
 
     CAMADAS_ORD = ["A — Alto valor", "B — Médio valor", "C — Base"]
     STATUS_ORD  = ["ativo", "em_risco", "hibernando", "hibernando_sazonal", "perdido"]
@@ -1833,19 +2024,19 @@ padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
 
         def _bg_status(val):
             m = {
-                "Em Risco":         "background-color:#fff3cd",
-                "Hibernando":       "background-color:#ffe0b2",
-                "Perdido":          "background-color:#f8d7da",
-                "Hibern. Sazonal":  "background-color:#ffe0b2",
-                "Ativo":            "background-color:#d4edda",
+                "Em Risco":         "background-color:#fbf3e0",
+                "Hibernando":       "background-color:#f5e7d8",
+                "Perdido":          "background-color:#f2e3e2",
+                "Hibern. Sazonal":  "background-color:#f5e7d8",
+                "Ativo":            "background-color:#e8f1ea",
             }
             return m.get(val, "")
 
         def _bg_cam(val):
             m = {
-                "A — Alto valor":  "background-color:#d2e3fc;color:#0d47a1;font-weight:600",
-                "B — Médio valor": "background-color:#fff3cd;color:#856404",
-                "C — Base":        "background-color:#f1f3f4;color:#555",
+                "A — Alto valor":  "background-color:#e4ecf7;color:#1e3a5f;font-weight:600",
+                "B — Médio valor": "background-color:#fbf3e0;color:#7a5a1f",
+                "C — Base":        "background-color:#f4f5f6;color:#555",
             }
             return m.get(str(val), "")
 
@@ -1872,40 +2063,1112 @@ padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
             csv_nome, "Exportar fila (CSV)", key="csv_fila_estrat",
         )
 
-    st.divider()
+    # ── Maximização de receita ───────────────────────────────────────────
+    st.markdown(
+        "<div style='margin:48px 0 16px; padding:14px 18px; background:#fff; "
+        "border-left:4px solid #2d6a4f; border-top:1px solid #eef0f2; "
+        "border-right:1px solid #eef0f2; border-bottom:1px solid #eef0f2; "
+        "border-radius:4px;'>"
+        "<div style='font-size:0.7rem; font-weight:700; letter-spacing:0.12em; "
+        "text-transform:uppercase; color:#2d6a4f;'>Bloco 2 · Expandir</div>"
+        "<div style='font-size:1.35rem; font-weight:700; margin-top:2px; line-height:1.2; color:#111;'>"
+        "Próxima receita</div>"
+        "<div style='font-size:0.88rem; color:#5f6368; margin-top:2px;'>"
+        "Converter compra pontual em recorrência.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    # ── Novos clientes — últimos 60 dias ──────────────────────────────────
-    st.subheader("Novos clientes — últimos 60 dias")
+    from geo import classificar_tipologia
+
     hoje = pd.Timestamp(date.today())
-    novos60 = df_cart[
-        (hoje - df_cart["primeira_compra"]).dt.days <= 60
-    ].copy()
+    base_estrat = df_cart[df_cart["status_cliente"] != "sem_compra"].copy()
     if seg_filter != "Todos":
-        novos60 = novos60[novos60["segmento"] == seg_filter]
-    novos60 = novos60.sort_values("valor_total_r", ascending=False)
-    novos60["Fat. Total"]   = novos60["valor_total_r"].apply(fmt_brl)
-    novos60["Ticket Medio"] = novos60["ticket_medio_r"].apply(fmt_brl)
-    novos60["1a Compra"]    = novos60["primeira_compra"].dt.strftime("%d/%m/%Y")
+        base_estrat = base_estrat[base_estrat["segmento"] == seg_filter]
 
-    exib_novos = novos60.rename(
-        columns={"nome_exibicao": "Cliente", "total_compras": "Compras"}
-    )[["Cliente", "segmento", "cidade", "uf", "1a Compra",
-       "Compras", "Fat. Total", "Ticket Medio"]]
+    try:
+        df_demo_estrat = load_carteira_demo()[["id", "grupo_cadastrado"]].drop_duplicates("id")
+        base_estrat = base_estrat.merge(df_demo_estrat, on="id", how="left")
+    except Exception:
+        base_estrat["grupo_cadastrado"] = None
 
-    st.dataframe(exib_novos, use_container_width=True, height=280, hide_index=True)
-    n_novos = f"{len(novos60):,}".replace(",", ".")
-    st.caption(f"{n_novos} novos clientes nos últimos 60 dias")
-    if not novos60.empty:
-        botao_csv(exib_novos, "novos_clientes_60d", key="csv_novos60")
+    base_estrat["tipologia"] = base_estrat["grupo_cadastrado"].map(classificar_tipologia)
+    base_estrat["vendedor"] = base_estrat["nome_exibicao"].map(vend_map)
+    base_estrat["dias_desde_primeira"] = (hoje - base_estrat["primeira_compra"]).dt.days
+    base_estrat["gap_medio_segmento"] = calcular_gap_medio_segmento(base_estrat)
+
+    ticket_seg = base_estrat.groupby("segmento")["ticket_medio_r"].transform("mean")
+    ticket_global = base_estrat["ticket_medio_r"].median()
+    if pd.isna(ticket_global) or ticket_global <= 0:
+        ticket_global = 1.0
+    base_estrat["ticket_media_segmento"] = ticket_seg.fillna(ticket_global).replace(0, ticket_global)
+    base_estrat["indice_ticket_seg"] = (
+        base_estrat["ticket_medio_r"] / base_estrat["ticket_media_segmento"].replace(0, pd.NA)
+    ).fillna(0)
+
+    ordem_prio = {"Alta": 0, "Média": 1, "Baixa": 2}
+
+    # Matriz 2×2 — Virar recorrente
+    segunda = base_estrat[
+        (base_estrat["total_compras"] == 1)
+        & base_estrat["dias_desde_primeira"].between(7, 180, inclusive="both")
+    ].copy()
+    segunda["janela_segunda_compra"] = segunda["dias_desde_primeira"].map(classificar_janela_segunda_compra)
+    _ticket_ok = segunda["indice_ticket_seg"] >= 1.0
+    _janela_ok = segunda["janela_segunda_compra"] == "Janela ideal"
+    segunda["prioridade"] = "Baixa"
+    segunda.loc[_ticket_ok | _janela_ok, "prioridade"] = "Média"
+    segunda.loc[_ticket_ok & _janela_ok, "prioridade"] = "Alta"
+    segunda["ord_prio"] = segunda["prioridade"].map(ordem_prio)
+    segunda = segunda.sort_values(
+        ["ord_prio", "indice_ticket_seg", "valor_total_r"],
+        ascending=[True, False, False],
+    )
+
+    # Matriz 2×2 — Aumentar frequência
+    expansao = base_estrat[
+        base_estrat["total_compras"].between(2, 4, inclusive="both")
+        & base_estrat["status_cliente"].isin(["ativo", "em_risco", "hibernando", "hibernando_sazonal"])
+    ].copy()
+    expansao["momento_expansao"] = expansao.apply(
+        lambda r: classificar_momento_expansao(r["dias_sem_compra"], r["gap_medio_segmento"]),
+        axis=1,
+    )
+    _ticket_ok = expansao["indice_ticket_seg"] >= 1.0
+    _momento_ok = expansao["momento_expansao"].isin(["Janela quente", "Pede ação"])
+    expansao["prioridade"] = "Baixa"
+    expansao.loc[_ticket_ok | _momento_ok, "prioridade"] = "Média"
+    expansao.loc[_ticket_ok & _momento_ok, "prioridade"] = "Alta"
+    expansao["ord_prio"] = expansao["prioridade"].map(ordem_prio)
+    expansao = expansao.sort_values(
+        ["ord_prio", "indice_ticket_seg", "valor_total_r"],
+        ascending=[True, False, False],
+    )
+
+    # Matriz 2×2 — Ancorar recém-chegados (com regra extra: já voltou = Alta sempre)
+    novos_prioritarios = base_estrat[
+        base_estrat["dias_desde_primeira"].between(0, 60, inclusive="both")
+    ].copy()
+    novos_prioritarios["janela_segunda_compra"] = novos_prioritarios["dias_desde_primeira"].map(
+        classificar_janela_segunda_compra
+    )
+    novos_prioritarios["sinal_retencao"] = novos_prioritarios["total_compras"].apply(
+        lambda v: "Já voltou" if pd.notna(v) and v >= 2 else "Ainda na 1ª compra"
+    )
+    _ja_voltou = novos_prioritarios["total_compras"] >= 2
+    _ticket_ok = novos_prioritarios["indice_ticket_seg"] >= 1.0
+    _janela_ok = novos_prioritarios["janela_segunda_compra"] == "Janela ideal"
+    novos_prioritarios["prioridade"] = "Baixa"
+    novos_prioritarios.loc[_ticket_ok | _janela_ok, "prioridade"] = "Média"
+    novos_prioritarios.loc[_ticket_ok & _janela_ok, "prioridade"] = "Alta"
+    novos_prioritarios.loc[_ja_voltou, "prioridade"] = "Alta"
+    novos_prioritarios["ord_prio"] = novos_prioritarios["prioridade"].map(ordem_prio)
+    novos_prioritarios = novos_prioritarios.sort_values(
+        ["ord_prio", "indice_ticket_seg", "total_compras", "valor_total_r"],
+        ascending=[True, False, False, False],
+    )
+
+    st.markdown(
+        "<div style='margin:8px 0 18px; padding:10px 14px; background:#f8f9fa; "
+        "border-left:3px solid #1A73E8; border-radius:4px; font-size:0.86rem; color:#333;'>"
+        "<b>Prioridade</b> = cruzamento de dois sinais por cliente. "
+        "<b style='color:#c0392b;'>Alta</b> se ticket ≥ média do segmento E timing dentro da janela da alavanca. "
+        "<b style='color:#b7791f;'>Média</b> se apenas um bate. "
+        "<b style='color:#666;'>Baixa</b> se nenhum bate."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    def _stat_card(
+        titulo: str,
+        elegibilidade: str,
+        timing: str,
+        df: pd.DataFrame,
+        extra_label: str,
+        extra_valor: str,
+    ) -> str:
+        alta = int((df["prioridade"] == "Alta").sum())
+        media = int((df["prioridade"] == "Média").sum())
+        baixa = int((df["prioridade"] == "Baixa").sum())
+        total = max(alta + media + baixa, 1)
+        p_alta = alta / total * 100
+        p_media = media / total * 100
+        p_baixa = baixa / total * 100
+        df_alta = df[df["prioridade"] == "Alta"]
+        ticket_alta = df_alta["ticket_medio_r"].mean() if not df_alta.empty else None
+        ticket_txt = fmt_brl(ticket_alta) if ticket_alta and pd.notna(ticket_alta) else "—"
+
+        return f"""
+<div style='border:1px solid #e6e8eb; border-radius:8px; padding:18px 18px 16px;
+            height:100%; background:#fff;'>
+  <div style='font-size:0.72rem; font-weight:700; letter-spacing:0.1em;
+              text-transform:uppercase; color:#1A73E8;'>{titulo}</div>
+  <div style='font-size:0.78rem; color:#666; margin-top:2px;'>{elegibilidade}</div>
+
+  <div style='display:flex; align-items:baseline; gap:8px; margin-top:14px;'>
+    <div style='font-size:2.2rem; font-weight:700; line-height:1; color:#111;'>{fmt_num(alta)}</div>
+    <div style='font-size:0.8rem; color:#c0392b; font-weight:600;'>Alta</div>
+  </div>
+
+  <div style='margin-top:10px; display:flex; height:8px; border-radius:4px;
+              overflow:hidden; background:#f1f3f4;'>
+    <div style='width:{p_alta:.2f}%; background:#c0392b;'></div>
+    <div style='width:{p_media:.2f}%; background:#b7791f;'></div>
+    <div style='width:{p_baixa:.2f}%; background:#9aa0a6;'></div>
+  </div>
+  <div style='display:flex; justify-content:space-between; font-size:0.75rem;
+              color:#555; margin-top:4px;'>
+    <span>Alta {fmt_num(alta)}</span>
+    <span>Média {fmt_num(media)}</span>
+    <span>Baixa {fmt_num(baixa)}</span>
+  </div>
+
+  <div style='margin-top:14px; padding-top:12px; border-top:1px solid #eef0f2;
+              font-size:0.8rem; color:#444; line-height:1.5;'>
+    <div><span style='color:#888;'>Timing:</span> {timing}</div>
+    <div style='margin-top:4px;'><span style='color:#888;'>Ticket médio (Alta):</span> {ticket_txt}</div>
+    <div style='margin-top:4px;'><span style='color:#888;'>{extra_label}:</span> {extra_valor}</div>
+  </div>
+</div>
+"""
+
+    alta_2a = segunda[segunda["prioridade"] == "Alta"]
+    if not alta_2a.empty:
+        uf_top = alta_2a["uf"].value_counts().head(1)
+        if len(uf_top):
+            pct_uf = f"{uf_top.iloc[0] / len(alta_2a) * 100:.0f}".replace(".", ",")
+            extra_2a = f"{pct_uf}% em {uf_top.index[0]}"
+        else:
+            extra_2a = "—"
+    else:
+        extra_2a = "—"
+
+    faixa_recompra = int(
+        expansao["momento_expansao"].isin(["Janela quente", "Pede ação"]).sum()
+    ) if not expansao.empty else 0
+    ja_voltaram = int((novos_prioritarios["total_compras"] >= 2).sum()) if not novos_prioritarios.empty else 0
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.markdown(
+            _stat_card(
+                titulo="Virar recorrente",
+                elegibilidade="1 compra, entre 7 e 180 dias atrás",
+                timing="15 a 60 dias desde a 1ª compra",
+                df=segunda,
+                extra_label="Concentração geográfica",
+                extra_valor=extra_2a,
+            ),
+            unsafe_allow_html=True,
+        )
+    with col_b:
+        st.markdown(
+            _stat_card(
+                titulo="Aumentar frequência",
+                elegibilidade="2 a 4 compras, ativo ou em risco",
+                timing="Intervalo sem comprar na faixa do segmento",
+                df=expansao,
+                extra_label="Na faixa de recompra",
+                extra_valor=fmt_num(faixa_recompra),
+            ),
+            unsafe_allow_html=True,
+        )
+    with col_c:
+        st.markdown(
+            _stat_card(
+                titulo="Ancorar recém-chegados",
+                elegibilidade="1ª compra nos últimos 60 dias",
+                timing="15 a 60 dias desde a 1ª compra",
+                df=novos_prioritarios,
+                extra_label="Já voltaram 2+ vezes",
+                extra_valor=fmt_num(ja_voltaram),
+            ),
+            unsafe_allow_html=True,
+        )
+
+    def _bg_prio(val):
+        cor = CORES_PRIORIDADE.get(str(val))
+        if not cor:
+            return ""
+        texto = "#111111" if val != "Alta" else "#ffffff"
+        return f"background-color:{cor};color:{texto};font-weight:600"
+
+    tab2a, tabexp, tabnov = st.tabs([
+        "Virar recorrente",
+        "Aumentar frequência",
+        "Ancorar recém-chegados",
+    ])
+
+    with tab2a:
+        if segunda.empty:
+            st.info("Nenhum cliente de compra única dentro da janela operacional de 2ª compra.")
+        else:
+            st.caption("Clientes com uma única compra que ainda podem ser convertidos em recorrentes.")
+            tb2 = segunda.copy()
+            tb2["1ª compra"] = tb2["primeira_compra"].dt.strftime("%d/%m/%Y")
+            tb2["Dias desde 1ª"] = tb2["dias_desde_primeira"].apply(lambda v: fmt_num(v, 0))
+            tb2["Ticket médio"] = tb2["ticket_medio_r"].apply(fmt_brl)
+            tb2["Ticket vs seg."] = tb2["indice_ticket_seg"].apply(
+                lambda v: f"{fmt_num(v * 100, 0)}%"
+            )
+            tb2["Valor atual"] = tb2["valor_total_r"].apply(fmt_brl)
+            tb2["Vendedor"] = tb2["vendedor"].fillna("—")
+            exib_2a = tb2.rename(columns={
+                "nome_exibicao": "Cliente",
+                "segmento": "Segmento",
+                "tipologia": "Perfil",
+                "cidade": "Cidade",
+                "uf": "UF",
+                "janela_segunda_compra": "Janela",
+                "prioridade": "Prioridade",
+            })[[
+                "Cliente", "Segmento", "Perfil", "Cidade", "UF", "Vendedor",
+                "1ª compra", "Dias desde 1ª", "Ticket médio", "Ticket vs seg.",
+                "Valor atual", "Janela", "Prioridade",
+            ]]
+            st.dataframe(
+                exib_2a.style.map(_bg_prio, subset=["Prioridade"]),
+                use_container_width=True,
+                hide_index=True,
+                height=340,
+            )
+            botao_csv(
+                segunda[[
+                    "nome_exibicao", "segmento", "tipologia", "cidade", "uf", "vendedor",
+                    "primeira_compra", "dias_desde_primeira", "ticket_medio_r",
+                    "indice_ticket_seg", "valor_total_r", "janela_segunda_compra",
+                    "prioridade", "indice_ticket_seg",
+                ]],
+                "fila_segunda_compra",
+                "Exportar fila 2ª compra (CSV)",
+                key="csv_segunda_compra",
+            )
+
+    with tabexp:
+        if expansao.empty:
+            st.info("Nenhum cliente com 2–4 compras e ticket acima da média para trabalhar expansão.")
+        else:
+            st.caption("Clientes que já provaram valor por pedido, mas ainda compram pouco.")
+            tbx = expansao.copy()
+            tbx["Compras"] = tbx["total_compras"].apply(lambda v: fmt_num(v, 0))
+            tbx["Ticket médio"] = tbx["ticket_medio_r"].apply(fmt_brl)
+            tbx["Ticket vs seg."] = tbx["indice_ticket_seg"].apply(
+                lambda v: f"{fmt_num(v * 100, 0)}%"
+            )
+            tbx["Dias s/comprar"] = tbx["dias_sem_compra"].apply(
+                lambda v: fmt_num(v, 0) if pd.notna(v) else "—"
+            )
+            tbx["Ciclo típico"] = tbx["gap_medio_segmento"].apply(lambda v: f"{fmt_num(v, 0)} dias")
+            tbx["Valor atual"] = tbx["valor_total_r"].apply(lambda v: fmt_brl(v, compact=True))
+            tbx["Vendedor"] = tbx["vendedor"].fillna("—")
+            exib_exp = tbx.rename(columns={
+                "nome_exibicao": "Cliente",
+                "segmento": "Segmento",
+                "tipologia": "Perfil",
+                "cidade": "Cidade",
+                "uf": "UF",
+                "momento_expansao": "Momento",
+                "prioridade": "Prioridade",
+            })[[
+                "Cliente", "Segmento", "Perfil", "Cidade", "UF", "Vendedor",
+                "Compras", "Ticket médio", "Ticket vs seg.", "Dias s/comprar",
+                "Ciclo típico", "Valor atual", "Momento", "Prioridade",
+            ]]
+            st.dataframe(
+                exib_exp.style.map(_bg_prio, subset=["Prioridade"]),
+                use_container_width=True,
+                hide_index=True,
+                height=340,
+            )
+            botao_csv(
+                expansao[[
+                    "nome_exibicao", "segmento", "tipologia", "cidade", "uf", "vendedor",
+                    "total_compras", "ticket_medio_r", "indice_ticket_seg",
+                    "dias_sem_compra", "gap_medio_segmento", "valor_total_r",
+                    "momento_expansao", "prioridade", "indice_ticket_seg",
+                ]],
+                "fila_expansao_frequencia",
+                "Exportar fila expansão (CSV)",
+                key="csv_expansao_freq",
+            )
+
+    with tabnov:
+        if novos_prioritarios.empty:
+            st.info("Nenhum novo cliente encontrado nos últimos 60 dias para o filtro atual.")
+        else:
+            st.caption("Priorização da retenção inicial: quem merece acompanhamento comercial mais próximo.")
+            tbn = novos_prioritarios.copy()
+            tbn["1ª compra"] = tbn["primeira_compra"].dt.strftime("%d/%m/%Y")
+            tbn["Compras"] = tbn["total_compras"].apply(lambda v: fmt_num(v, 0))
+            tbn["Dias desde 1ª"] = tbn["dias_desde_primeira"].apply(lambda v: fmt_num(v, 0))
+            tbn["Ticket médio"] = tbn["ticket_medio_r"].apply(fmt_brl)
+            tbn["Ticket vs seg."] = tbn["indice_ticket_seg"].apply(
+                lambda v: f"{fmt_num(v * 100, 0)}%"
+            )
+            tbn["Valor atual"] = tbn["valor_total_r"].apply(fmt_brl)
+            tbn["Vendedor"] = tbn["vendedor"].fillna("—")
+            exib_nov = tbn.rename(columns={
+                "nome_exibicao": "Cliente",
+                "segmento": "Segmento",
+                "tipologia": "Perfil",
+                "cidade": "Cidade",
+                "uf": "UF",
+                "janela_segunda_compra": "Janela",
+                "sinal_retencao": "Sinal",
+                "prioridade": "Prioridade",
+            })[[
+                "Cliente", "Segmento", "Perfil", "Cidade", "UF", "Vendedor",
+                "1ª compra", "Dias desde 1ª", "Compras", "Ticket médio",
+                "Ticket vs seg.", "Valor atual", "Sinal", "Janela", "Prioridade",
+            ]]
+            st.dataframe(
+                exib_nov.style.map(_bg_prio, subset=["Prioridade"]),
+                use_container_width=True,
+                hide_index=True,
+                height=340,
+            )
+            botao_csv(
+                novos_prioritarios[[
+                    "nome_exibicao", "segmento", "tipologia", "cidade", "uf", "vendedor",
+                    "primeira_compra", "dias_desde_primeira", "total_compras",
+                    "ticket_medio_r", "indice_ticket_seg", "valor_total_r",
+                    "sinal_retencao", "janela_segunda_compra", "prioridade", "indice_ticket_seg",
+                ]],
+                "fila_novos_prioritarios",
+                "Exportar fila novos prioritários (CSV)",
+                key="csv_novos_prioritarios",
+            )
+
+    with st.expander("Base completa — novos clientes dos últimos 60 dias", expanded=False):
+        novos60 = base_estrat[base_estrat["dias_desde_primeira"].between(0, 60, inclusive="both")].copy()
+        novos60 = novos60.sort_values("valor_total_r", ascending=False)
+        novos60["Fat. Total"] = novos60["valor_total_r"].apply(fmt_brl)
+        novos60["Ticket Medio"] = novos60["ticket_medio_r"].apply(fmt_brl)
+        novos60["1a Compra"] = novos60["primeira_compra"].dt.strftime("%d/%m/%Y")
+        exib_novos = novos60.rename(
+            columns={"nome_exibicao": "Cliente", "total_compras": "Compras"}
+        )[["Cliente", "segmento", "cidade", "uf", "1a Compra",
+           "Compras", "Fat. Total", "Ticket Medio"]]
+        st.dataframe(exib_novos, use_container_width=True, height=260, hide_index=True)
+        st.caption(f"{fmt_num(len(novos60))} novos clientes nos últimos 60 dias")
+        if not novos60.empty:
+            botao_csv(exib_novos, "novos_clientes_60d", key="csv_novos60")
 
     st.caption(
-        "Para análise de performance dos vendedores sobre esses clientes, "
+        "Para acompanhamento do desempenho comercial por vendedor nessas filas, "
         "acesse o painel **Vendedores**."
     )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PAINEL 5 — VENDEDORES
+# PAINEL 5 — DEMOGRAPHICS
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif painel == "Demografia":
+
+    st.title("Demografia e Distribuição")
+    st.caption("Quem são os clientes, onde estão e quão longe a marca chega.")
+
+    from geo import (
+        enriquecer_carteira_geo, classificar_faixa, classificar_tipologia,
+        ORDEM_FAIXAS, ORDEM_TIPOLOGIAS, CORES_TIPOLOGIA, CORES_FAIXA,
+        SEDE_LAT, SEDE_LON, circle_points_km,
+    )
+
+    try:
+        with st.spinner("Carregando dados geográficos..."):
+            df_geo_full = load_carteira_geo_cached()
+    except Exception as _e:
+        st.error(
+            f"Erro ao carregar dados para o painel Demografia: **{_e}**\n\n"
+            "Verifique se a migração `sql/002_grupo_cadastrado.sql` foi aplicada no Supabase."
+        )
+        st.stop()
+
+    df_geo = seg(df_geo_full)
+    df_ativos = df_geo[df_geo["status_cliente"] != "sem_compra"].copy()
+
+    if df_ativos.empty:
+        st.warning("Nenhum cliente encontrado para o filtro selecionado.")
+        st.stop()
+
+    _tip_agg = (
+        df_ativos
+        .groupby("tipologia", as_index=False)
+        .agg(
+            n_clientes=("id", "count"),
+            ltv=("valor_total_r", "sum"),
+            ticket_medio=("ticket_medio_r", "mean"),
+            dist_media=("distancia_km", "mean"),
+        )
+        .round({"ltv": 0, "ticket_medio": 0, "dist_media": 0})
+    )
+    _ltv_total_tip = float(_tip_agg["ltv"].sum())
+    _tip_agg["pct_ltv"] = (_tip_agg["ltv"] / _ltv_total_tip * 100).round(1)
+    _tip_agg["ltv_por_cliente"] = (
+        _tip_agg["ltv"] / _tip_agg["n_clientes"].replace(0, pd.NA)
+    ).round(0)
+    _tip_agg = _tip_agg.merge(
+        pd.DataFrame({"tipologia": ORDEM_TIPOLOGIAS}), on="tipologia", how="right"
+    ).fillna({
+        "n_clientes": 0, "ltv": 0, "pct_ltv": 0, "ltv_por_cliente": 0,
+        "ticket_medio": 0, "dist_media": 0,
+    })
+    _tip_agg = _tip_agg[_tip_agg["n_clientes"] > 0].sort_values("ltv", ascending=False)
+
+    st.subheader("Perfis da carteira")
+    _col_t1, _col_t2 = st.columns([1.15, 1.85])
+
+    with _col_t1:
+        _fig_tip = go.Figure(go.Bar(
+            y=_tip_agg["tipologia"],
+            x=_tip_agg["n_clientes"],
+            orientation="h",
+            marker_color=[CORES_TIPOLOGIA.get(t, "#ccc") for t in _tip_agg["tipologia"]],
+            text=_tip_agg.apply(
+                lambda r: f"{fmt_num(r['n_clientes'])} · {fmt_num(r['pct_ltv'], 1)}% do LTV",
+                axis=1,
+            ),
+            textposition="outside",
+            cliponaxis=False,
+        ))
+        _fig_tip.update_layout(
+            height=320, margin=dict(l=0, r=120, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            showlegend=False,
+        )
+        _fig_tip.update_xaxes(title_text="Clientes", gridcolor="#f0f0f0")
+        _fig_tip.update_yaxes(showgrid=False, categoryorder="total ascending")
+        apply_ptbr(_fig_tip)
+        st.plotly_chart(_fig_tip, use_container_width=True)
+
+    with _col_t2:
+        _fig_bubble = px.scatter(
+            _tip_agg,
+            x="ticket_medio",
+            y="ltv_por_cliente",
+            size="n_clientes",
+            color="tipologia",
+            color_discrete_map=CORES_TIPOLOGIA,
+            text="tipologia",
+            labels={
+                "ticket_medio": "Ticket médio (R$)",
+                "ltv_por_cliente": "LTV por cliente (R$)",
+                "tipologia": "",
+            },
+        )
+        _fig_bubble.update_traces(
+            textposition="top center",
+            marker=dict(line=dict(color="#ffffff", width=1.5), opacity=0.88),
+        )
+        _fig_bubble.update_layout(
+            height=320, margin=dict(l=0, r=0, t=10, b=0),
+            legend=dict(orientation="h", y=-0.25),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+        )
+        _fig_bubble.update_xaxes(tickprefix="R$ ", gridcolor="#f0f0f0")
+        _fig_bubble.update_yaxes(tickprefix="R$ ", gridcolor="#f0f0f0")
+        apply_ptbr(_fig_bubble)
+        st.plotly_chart(_fig_bubble, use_container_width=True)
+
+    _exib_tip = _tip_agg.copy()
+    _exib_tip["Clientes"] = _exib_tip["n_clientes"].apply(lambda v: fmt_num(int(v)))
+    _exib_tip["LTV total"] = _exib_tip["ltv"].apply(lambda v: fmt_brl(v, compact=True))
+    _exib_tip["LTV / cliente"] = _exib_tip["ltv_por_cliente"].apply(
+        lambda v: fmt_brl(v) if pd.notna(v) and v > 0 else "—"
+    )
+    _exib_tip["Ticket médio"] = _exib_tip["ticket_medio"].apply(
+        lambda v: fmt_brl(v) if pd.notna(v) and v > 0 else "—"
+    )
+    _exib_tip["Distância média"] = _exib_tip["dist_media"].apply(
+        lambda v: f"{fmt_num(v, 0)} km" if pd.notna(v) and v > 0 else "—"
+    )
+    st.dataframe(
+        _exib_tip.rename(columns={"tipologia": "Tipologia"})[
+            ["Tipologia", "Clientes", "LTV total", "LTV / cliente", "Ticket médio", "Distância média"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.divider()
+    st.subheader("Mapa de presença")
+
+    _mapa_base = df_ativos.dropna(subset=["lat", "lon"]).copy()
+    if _mapa_base.empty:
+        st.info("Nenhum cliente com geolocalização encontrada.")
+    else:
+        _mapa_agg = (
+            _mapa_base
+            .groupby(["cidade", "uf", "lat", "lon"], as_index=False)
+            .agg(
+                n_clientes=("id", "count"),
+                ltv=("valor_total_r", "sum"),
+                ticket_medio=("ticket_medio_r", "mean"),
+            )
+        )
+        _tip_pred = (
+            _mapa_base.groupby(["cidade", "uf"])["tipologia"]
+            .agg(lambda x: x.value_counts().index[0] if len(x) else "Sem classificação")
+            .reset_index()
+            .rename(columns={"tipologia": "tipologia_pred"})
+        )
+        _mapa_agg = _mapa_agg.merge(_tip_pred, on=["cidade", "uf"], how="left")
+        _mapa_modo = st.radio(
+            "Mapa",
+            ["Calor por LTV", "Calor por clientes"],
+            horizontal=True,
+            key="radio_cor_mapa",
+        )
+        _z_col = "ltv" if _mapa_modo == "Calor por LTV" else "n_clientes"
+        _z_title = "LTV (R$)" if _z_col == "ltv" else "Clientes"
+        _raio_medio = (
+            (_mapa_base["distancia_km"] * _mapa_base["valor_total_r"]).sum()
+            / _mapa_base["valor_total_r"].sum()
+        ) if _mapa_base["distancia_km"].notna().any() and _mapa_base["valor_total_r"].sum() > 0 else None
+
+        _fig_mapa = px.density_mapbox(
+            _mapa_agg,
+            lat="lat",
+            lon="lon",
+            z=_z_col,
+            radius=34 if _z_col == "ltv" else 28,
+            center={"lat": -14.0, "lon": -50.0},
+            zoom=2.6,
+            mapbox_style="carto-positron",
+            color_continuous_scale=[
+                [0.0, "#e8f1ff"],
+                [0.25, "#a8c8ff"],
+                [0.50, "#5b96f7"],
+                [0.75, "#1e63d6"],
+                [1.0, "#0d3b8e"],
+            ],
+            hover_data=None,
+        )
+        _fig_mapa.update_traces(opacity=0.85, showscale=True)
+
+        _hover_size = (_mapa_agg["n_clientes"].clip(lower=1) ** 0.45) * 8 + 4
+        _fig_mapa.add_trace(go.Scattermapbox(
+            lat=_mapa_agg["lat"],
+            lon=_mapa_agg["lon"],
+            mode="markers",
+            marker=dict(size=_hover_size, color="rgba(13,59,142,0.18)"),
+            text=_mapa_agg.apply(
+                lambda r: (
+                    f"{r['cidade']}/{r['uf']}<br>"
+                    f"Clientes: {fmt_num(r['n_clientes'])}<br>"
+                    f"LTV: {fmt_brl(r['ltv'], compact=True)}<br>"
+                    f"Ticket médio: {fmt_brl(r['ticket_medio'])}<br>"
+                    f"Perfil dominante: {r['tipologia_pred']}"
+                ),
+                axis=1,
+            ),
+            hovertemplate="%{text}<extra></extra>",
+            name="Cidades",
+            showlegend=False,
+        ))
+
+        if _raio_medio and _raio_medio > 0:
+            _circle_lat, _circle_lon = circle_points_km(SEDE_LAT, SEDE_LON, float(_raio_medio))
+            _fig_mapa.add_trace(go.Scattermapbox(
+                lat=_circle_lat,
+                lon=_circle_lon,
+                mode="lines",
+                line=dict(color="rgba(11,79,159,0.70)", width=2),
+                hovertemplate=f"Raio médio: {fmt_num(_raio_medio, 0)} km<extra></extra>",
+                name="Raio médio",
+            ))
+
+        _fig_mapa.add_trace(go.Scattermapbox(
+            lat=[SEDE_LAT],
+            lon=[SEDE_LON],
+            mode="markers+text",
+            text=["Sede"],
+            textposition="top right",
+            marker=dict(size=11, color="#111111"),
+            hovertemplate="Santa Cruz do Capibaribe/PE<extra></extra>",
+            name="Sede",
+        ))
+        _fig_mapa.update_layout(
+            height=560,
+            margin=dict(l=0, r=0, t=10, b=0),
+            paper_bgcolor="#fff",
+            coloraxis_colorbar=dict(title=_z_title),
+            legend=dict(orientation="h", y=-0.08),
+        )
+        apply_ptbr(_fig_mapa)
+        st.plotly_chart(_fig_mapa, use_container_width=True)
+        st.caption(
+            f"Raio médio = {fmt_num(_raio_medio, 0)} km."
+            if _raio_medio else
+            "Raio médio indisponível."
+        )
+
+        _cidades_top = _mapa_agg.sort_values("ltv", ascending=False).head(15).copy()
+        _cidades_top["Clientes"] = _cidades_top["n_clientes"].apply(fmt_num)
+        _cidades_top["LTV"] = _cidades_top["ltv"].apply(lambda v: fmt_brl(v, compact=True))
+        _cidades_top["Ticket médio"] = _cidades_top["ticket_medio"].apply(fmt_brl)
+        st.dataframe(
+            _cidades_top.rename(columns={
+                "cidade": "Cidade", "uf": "UF", "tipologia_pred": "Perfil dominante"
+            })[["Cidade", "UF", "Clientes", "LTV", "Ticket médio", "Perfil dominante"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    st.subheader("Distribuição por distância")
+
+    _faixa_agg = (
+        df_ativos.groupby("faixa_distancia", as_index=False)
+        .agg(
+            n_clientes=("id", "count"),
+            ltv=("valor_total_r", "sum"),
+            ticket_medio=("ticket_medio_r", "mean"),
+        )
+    )
+    _faixa_agg = (
+        pd.DataFrame({"faixa_distancia": ORDEM_FAIXAS})
+        .merge(_faixa_agg, on="faixa_distancia", how="left")
+        .fillna(0)
+    )
+
+    _col_f1, _col_f2 = st.columns(2)
+    with _col_f1:
+        _fig_fc = go.Figure(go.Bar(
+            y=_faixa_agg["faixa_distancia"],
+            x=_faixa_agg["n_clientes"],
+            orientation="h",
+            marker_color=[CORES_FAIXA.get(f, "#ccc") for f in _faixa_agg["faixa_distancia"]],
+            text=_faixa_agg["n_clientes"].astype(int).apply(fmt_num),
+            textposition="outside",
+            cliponaxis=False,
+        ))
+        _fig_fc.update_layout(
+            height=300, margin=dict(l=0, r=50, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+        )
+        _fig_fc.update_xaxes(title_text="Clientes", gridcolor="#f0f0f0")
+        _fig_fc.update_yaxes(showgrid=False, categoryorder="array",
+                             categoryarray=list(reversed(ORDEM_FAIXAS)))
+        apply_ptbr(_fig_fc)
+        st.plotly_chart(_fig_fc, use_container_width=True)
+
+    with _col_f2:
+        _fig_fl = go.Figure(go.Bar(
+            y=_faixa_agg["faixa_distancia"],
+            x=_faixa_agg["ltv"],
+            orientation="h",
+            marker_color=[CORES_FAIXA.get(f, "#ccc") for f in _faixa_agg["faixa_distancia"]],
+            text=_faixa_agg["ltv"].apply(lambda v: fmt_brl(v, compact=True)),
+            textposition="outside",
+            cliponaxis=False,
+        ))
+        _fig_fl.update_layout(
+            height=300, margin=dict(l=0, r=80, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+        )
+        _fig_fl.update_xaxes(tickprefix="R$ ", tickformat=",.0f", gridcolor="#f0f0f0")
+        _fig_fl.update_yaxes(showgrid=False, categoryorder="array",
+                             categoryarray=list(reversed(ORDEM_FAIXAS)))
+        apply_ptbr(_fig_fl)
+        st.plotly_chart(_fig_fl, use_container_width=True)
+
+    st.markdown("**Tipologia × faixa de distância**")
+    _modo_matriz = st.radio(
+        "Exibir",
+        ["Nº de clientes", "LTV agregado (R$)", "Ticket médio (R$)"],
+        horizontal=True,
+        key="radio_matriz",
+    )
+    _mat_base = df_ativos.copy()
+    _mat_n = _mat_base.groupby(["tipologia", "faixa_distancia"]).size().unstack(fill_value=0)
+    _mat_ltv = _mat_base.groupby(["tipologia", "faixa_distancia"])["valor_total_r"].sum().unstack(fill_value=0)
+    _mat_ticket = _mat_base.groupby(["tipologia", "faixa_distancia"])["ticket_medio_r"].mean().unstack(fill_value=0)
+    _mat_map = {
+        "Nº de clientes": _mat_n,
+        "LTV agregado (R$)": _mat_ltv,
+        "Ticket médio (R$)": _mat_ticket,
+    }
+    _mat_plot = _mat_map[_modo_matriz].reindex(index=ORDEM_TIPOLOGIAS, columns=ORDEM_FAIXAS, fill_value=0)
+    _mat_plot = _mat_plot.loc[_mat_plot.sum(axis=1) > 0]
+
+    if not _mat_plot.empty:
+        if _modo_matriz == "Nº de clientes":
+            _fmt_cell = lambda v: fmt_num(int(v)) if v > 0 else "—"
+        else:
+            _fmt_cell = lambda v: fmt_brl(v, compact=True) if pd.notna(v) and v > 0 else "—"
+        _fig_mat = go.Figure(go.Heatmap(
+            z=_mat_plot.values,
+            x=list(_mat_plot.columns),
+            y=list(_mat_plot.index),
+            colorscale=[
+                [0.0, "#eef4ff"],
+                [0.30, "#bbd2ff"],
+                [0.65, "#5b96f7"],
+                [1.0, "#0d3b8e"],
+            ],
+            text=[[_fmt_cell(v) for v in row] for row in _mat_plot.values],
+            texttemplate="%{text}",
+            hovertemplate="Tipologia: %{y}<br>Faixa: %{x}<br>Valor: %{text}<extra></extra>",
+            showscale=False,
+        ))
+        _fig_mat.update_layout(
+            height=max(260, 42 * len(_mat_plot) + 80),
+            margin=dict(l=0, r=0, t=10, b=0),
+            paper_bgcolor="#fff",
+            xaxis=dict(tickangle=-20),
+        )
+        apply_ptbr(_fig_mat)
+        st.plotly_chart(_fig_mat, use_container_width=True)
+
+    st.divider()
+    st.subheader("Quem compra os itens mais caros")
+    try:
+        df_itens_demo = aplicar_periodo(seg(load_itens_clientes()), periodo, "data_venda")
+        if not df_itens_demo.empty and df_itens_demo["preco_unitario_r"].notna().any():
+            _origens_itens = sorted(df_itens_demo["origem"].dropna().unique().tolist())
+            if _origens_itens == ["TRAY"]:
+                st.caption("Escopo atual: itens disponíveis apenas do e-commerce/Tray.")
+
+            _geo_item = df_geo_full[["id", "tipologia", "faixa_distancia"]].rename(columns={"id": "cliente_id"})
+            _it_demo = df_itens_demo.merge(_geo_item, on="cliente_id", how="left")
+            _it_demo["tipologia"] = _it_demo["tipologia"].fillna(_it_demo["grupo_cadastrado"].map(classificar_tipologia))
+            _it_demo["faixa_distancia"] = _it_demo["faixa_distancia"].fillna("Sem localização")
+            _it_demo = _it_demo[_it_demo["cliente_id"].notna() & _it_demo["preco_unitario_r"].notna()]
+
+            if not _it_demo.empty:
+                _cut = float(_it_demo["preco_unitario_r"].quantile(0.90))
+                _premium = _it_demo[_it_demo["preco_unitario_r"] >= _cut].copy()
+                st.caption(
+                    f"Recorte premium = top 10% do preço unitário da base atual "
+                    f"(a partir de {fmt_brl(_cut)})."
+                )
+
+                _col_p1, _col_p2 = st.columns([1.1, 1.9])
+                with _col_p1:
+                    _prem_tip = (
+                        _premium.groupby("tipologia", as_index=False)
+                        .agg(
+                            clientes=("cliente_id", "nunique"),
+                            preco_medio=("preco_unitario_r", "mean"),
+                            receita=("valor_total_item_r", "sum"),
+                        )
+                        .sort_values("clientes", ascending=True)
+                    )
+                    _fig_prem = go.Figure(go.Bar(
+                        y=_prem_tip["tipologia"],
+                        x=_prem_tip["clientes"],
+                        orientation="h",
+                        marker_color=[CORES_TIPOLOGIA.get(t, "#ccc") for t in _prem_tip["tipologia"]],
+                        text=_prem_tip["preco_medio"].apply(fmt_brl),
+                        textposition="outside",
+                        cliponaxis=False,
+                    ))
+                    _fig_prem.update_layout(
+                        height=300, margin=dict(l=0, r=70, t=10, b=0),
+                        plot_bgcolor="#fff", paper_bgcolor="#fff",
+                        showlegend=False,
+                    )
+                    _fig_prem.update_xaxes(title_text="Clientes premium", gridcolor="#f0f0f0")
+                    _fig_prem.update_yaxes(showgrid=False)
+                    apply_ptbr(_fig_prem)
+                    st.plotly_chart(_fig_prem, use_container_width=True)
+
+                with _col_p2:
+                    _cli_prem = (
+                        _premium.groupby(
+                            ["cliente_id", "nome_exibicao", "tipologia", "cidade", "uf"], as_index=False
+                        )
+                        .agg(
+                            itens_premium=("item_id", "count"),
+                            max_preco=("preco_unitario_r", "max"),
+                            preco_medio=("preco_unitario_r", "mean"),
+                            ltv_cliente=("cliente_ltv_r", "max"),
+                            ticket_cliente=("cliente_ticket_medio_r", "max"),
+                        )
+                        .sort_values(["max_preco", "itens_premium"], ascending=[False, False])
+                        .head(15)
+                    )
+                    _cli_prem["Item premium"] = _cli_prem["itens_premium"].apply(fmt_num)
+                    _cli_prem["Maior preço"] = _cli_prem["max_preco"].apply(fmt_brl)
+                    _cli_prem["Preço médio"] = _cli_prem["preco_medio"].apply(fmt_brl)
+                    _cli_prem["LTV"] = _cli_prem["ltv_cliente"].apply(
+                        lambda v: fmt_brl(v, compact=True) if pd.notna(v) else "—"
+                    )
+                    _cli_prem["Ticket cliente"] = _cli_prem["ticket_cliente"].apply(
+                        lambda v: fmt_brl(v) if pd.notna(v) else "—"
+                    )
+                    st.dataframe(
+                        _cli_prem.rename(columns={
+                            "nome_exibicao": "Cliente",
+                            "tipologia": "Perfil",
+                            "cidade": "Cidade",
+                            "uf": "UF",
+                        })[[
+                            "Cliente", "Perfil", "Cidade", "UF",
+                            "Item premium", "Maior preço", "Preço médio",
+                            "LTV", "Ticket cliente",
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=300,
+                    )
+            else:
+                st.info("Os itens disponíveis ainda não têm cliente identificado suficiente para esta leitura.")
+        else:
+            st.info("Não há itens disponíveis para o filtro atual.")
+    except Exception as _e:
+        st.info(f"Não foi possível carregar a análise de itens neste painel: {_e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAINEL 6 — ITENS
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif painel == "Itens":
+
+    st.title("Itens e Mix de Produto")
+    st.caption("Produtos vendidos, faixas de preço e quem compra os itens mais caros.")
+    from geo import CORES_TIPOLOGIA, ORDEM_TIPOLOGIAS, classificar_tipologia
+
+    try:
+        with st.spinner("Carregando itens vendidos..."):
+            df_itens = aplicar_periodo(seg(load_itens_clientes()), periodo, "data_venda")
+    except Exception as _e:
+        st.error(f"Erro ao carregar itens de venda: **{_e}**")
+        st.stop()
+
+    if df_itens.empty:
+        st.info("Não há itens disponíveis para o filtro atual.")
+        st.stop()
+
+    _origens_itens = sorted(df_itens["origem"].dropna().unique().tolist())
+    if _origens_itens == ["TRAY"]:
+        st.warning(
+            "Escopo atual: este painel usa apenas itens do e-commerce/Tray. "
+            "Ainda não representa o mix completo do DAPIC/atacado."
+        )
+
+    _it_validos = df_itens[df_itens["preco_unitario_r"].notna()].copy()
+    _preco_medio = _it_validos["preco_unitario_r"].mean() if not _it_validos.empty else None
+    _faturamento_itens = _it_validos["valor_total_item_r"].sum() if not _it_validos.empty else 0
+    _cut_premium = float(_it_validos["preco_unitario_r"].quantile(0.90)) if not _it_validos.empty else None
+    _premium = _it_validos[_it_validos["preco_unitario_r"] >= _cut_premium].copy() if _cut_premium else pd.DataFrame()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Itens vendidos", fmt_num(len(_it_validos)))
+    with c2:
+        st.metric("SKUs distintos", fmt_num(_it_validos["referencia"].fillna(_it_validos["sku"]).nunique()))
+    with c3:
+        st.metric("Preço médio unitário", fmt_brl(_preco_medio) if _preco_medio else "—")
+    with c4:
+        st.metric("Receita em itens", fmt_brl(_faturamento_itens, compact=True))
+
+    st.divider()
+    st.subheader("Mix de preço dos itens")
+
+    _faixa_agg = (
+        _it_validos.groupby("faixa_preco_item", as_index=False)
+        .agg(
+            itens=("item_id", "count"),
+            receita=("valor_total_item_r", "sum"),
+            preco_medio=("preco_unitario_r", "mean"),
+        )
+    )
+    _ordem_preco = ["Até R$ 49", "R$ 50–99", "R$ 100–149", "R$ 150–199", "R$ 200+", "Sem preço"]
+    _faixa_agg["ord"] = _faixa_agg["faixa_preco_item"].map({v: i for i, v in enumerate(_ordem_preco)})
+    _faixa_agg = _faixa_agg.sort_values("ord")
+
+    _col_i1, _col_i2 = st.columns([1.15, 1.85])
+    with _col_i1:
+        _fig_preco = go.Figure(go.Bar(
+            x=_faixa_agg["faixa_preco_item"],
+            y=_faixa_agg["itens"],
+            marker_color="#1A73E8",
+            text=_faixa_agg["receita"].apply(lambda v: fmt_brl(v, compact=True)),
+            textposition="outside",
+            cliponaxis=False,
+        ))
+        _fig_preco.update_layout(
+            height=310, margin=dict(l=0, r=0, t=10, b=0),
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+        )
+        _fig_preco.update_xaxes(showgrid=False, title_text="")
+        _fig_preco.update_yaxes(title_text="Itens", gridcolor="#f0f0f0")
+        apply_ptbr(_fig_preco)
+        st.plotly_chart(_fig_preco, use_container_width=True)
+
+    with _col_i2:
+        _prod_top = (
+            _it_validos.groupby(["referencia", "produto"], as_index=False)
+            .agg(
+                itens=("item_id", "count"),
+                clientes=("cliente_id", "nunique"),
+                receita=("valor_total_item_r", "sum"),
+                preco_medio=("preco_unitario_r", "mean"),
+                preco_max=("preco_unitario_r", "max"),
+            )
+            .sort_values(["preco_medio", "receita"], ascending=[False, False])
+            .head(15)
+        )
+        _prod_top["Receita"] = _prod_top["receita"].apply(lambda v: fmt_brl(v, compact=True))
+        _prod_top["Preço médio"] = _prod_top["preco_medio"].apply(fmt_brl)
+        _prod_top["Preço máx."] = _prod_top["preco_max"].apply(fmt_brl)
+        _prod_top["Itens"] = _prod_top["itens"].apply(fmt_num)
+        _prod_top["Clientes"] = _prod_top["clientes"].apply(fmt_num)
+        st.dataframe(
+            _prod_top.rename(columns={"referencia": "Ref.", "produto": "Produto"})[
+                ["Ref.", "Produto", "Itens", "Clientes", "Receita", "Preço médio", "Preço máx."]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            height=310,
+        )
+
+    st.divider()
+    st.subheader("Quem compra os itens mais caros")
+
+    if _premium.empty:
+        st.info("Não há massa suficiente de itens para identificar o recorte premium.")
+    else:
+        st.caption(
+            f"Recorte premium = top 10% do preço unitário da base atual "
+            f"(a partir de {fmt_brl(_cut_premium)})."
+        )
+
+        _premium["tipologia"] = _premium["grupo_cadastrado"].map(classificar_tipologia)
+        _premium["faixa_distancia"] = "Sem localização"
+        try:
+            _geo_lookup = load_carteira_geo_cached()[["id", "tipologia", "faixa_distancia"]].rename(
+                columns={"id": "cliente_id"}
+            )
+            _premium = _premium.drop(columns=["tipologia", "faixa_distancia"], errors="ignore").merge(
+                _geo_lookup,
+                on="cliente_id",
+                how="left",
+            )
+            _premium["tipologia"] = _premium["tipologia"].fillna("Sem classificação")
+            _premium["faixa_distancia"] = _premium["faixa_distancia"].fillna("Sem localização")
+        except Exception:
+            pass
+
+        _col_p1, _col_p2 = st.columns([1.0, 2.0])
+        with _col_p1:
+            _premium_tip = (
+                _premium.groupby("tipologia", as_index=False)
+                .agg(
+                    clientes=("cliente_id", "nunique"),
+                    receita=("valor_total_item_r", "sum"),
+                    preco_medio=("preco_unitario_r", "mean"),
+                )
+                .sort_values("clientes", ascending=True)
+            )
+            _fig_tip = go.Figure(go.Bar(
+                y=_premium_tip["tipologia"],
+                x=_premium_tip["clientes"],
+                orientation="h",
+                marker_color=[CORES_TIPOLOGIA.get(t, "#ccc") for t in _premium_tip["tipologia"]],
+                text=_premium_tip["preco_medio"].apply(fmt_brl),
+                textposition="outside",
+                cliponaxis=False,
+            ))
+            _fig_tip.update_layout(
+                height=320, margin=dict(l=0, r=70, t=10, b=0),
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                showlegend=False,
+            )
+            _fig_tip.update_xaxes(title_text="Clientes premium", gridcolor="#f0f0f0")
+            _fig_tip.update_yaxes(showgrid=False)
+            apply_ptbr(_fig_tip)
+            st.plotly_chart(_fig_tip, use_container_width=True)
+
+        with _col_p2:
+            _cli_top = (
+                _premium.groupby(
+                    ["cliente_id", "nome_exibicao", "tipologia", "cidade", "uf", "faixa_distancia"],
+                    as_index=False,
+                )
+                .agg(
+                    itens=("item_id", "count"),
+                    produtos=("referencia", "nunique"),
+                    maior_preco=("preco_unitario_r", "max"),
+                    preco_medio=("preco_unitario_r", "mean"),
+                    ltv=("cliente_ltv_r", "max"),
+                    ticket=("cliente_ticket_medio_r", "max"),
+                )
+                .sort_values(["maior_preco", "itens"], ascending=[False, False])
+                .head(20)
+            )
+            _cli_top["Itens"] = _cli_top["itens"].apply(fmt_num)
+            _cli_top["SKUs"] = _cli_top["produtos"].apply(fmt_num)
+            _cli_top["Maior preço"] = _cli_top["maior_preco"].apply(fmt_brl)
+            _cli_top["Preço médio"] = _cli_top["preco_medio"].apply(fmt_brl)
+            _cli_top["LTV"] = _cli_top["ltv"].apply(
+                lambda v: fmt_brl(v, compact=True) if pd.notna(v) else "—"
+            )
+            _cli_top["Ticket cliente"] = _cli_top["ticket"].apply(
+                lambda v: fmt_brl(v) if pd.notna(v) else "—"
+            )
+            st.dataframe(
+                _cli_top.rename(columns={
+                    "nome_exibicao": "Cliente",
+                    "tipologia": "Perfil",
+                    "cidade": "Cidade",
+                    "uf": "UF",
+                    "faixa_distancia": "Distância",
+                })[[
+                    "Cliente", "Perfil", "Cidade", "UF", "Distância",
+                    "Itens", "SKUs", "Maior preço", "Preço médio",
+                    "LTV", "Ticket cliente",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+            )
+
+        st.markdown("**Perfis × faixa de preço**")
+        _heat_mix = (
+            _it_validos.assign(
+                tipologia=_it_validos["grupo_cadastrado"].map(classificar_tipologia)
+            )
+            .groupby(["tipologia", "faixa_preco_item"], as_index=False)
+            .agg(itens=("item_id", "count"))
+        )
+        _heat_pivot = _heat_mix.pivot(
+            index="tipologia",
+            columns="faixa_preco_item",
+            values="itens",
+        ).reindex(index=ORDEM_TIPOLOGIAS, columns=_ordem_preco[:-1], fill_value=0)
+        _heat_pivot = _heat_pivot.loc[_heat_pivot.sum(axis=1) > 0]
+        if not _heat_pivot.empty:
+            _fig_mix = go.Figure(go.Heatmap(
+                z=_heat_pivot.values,
+                x=list(_heat_pivot.columns),
+                y=list(_heat_pivot.index),
+                colorscale=[
+                    [0.0, "#eef4ff"],
+                    [0.30, "#bbd2ff"],
+                    [0.65, "#5b96f7"],
+                    [1.0, "#0d3b8e"],
+                ],
+                text=[[fmt_num(int(v)) if v > 0 else "—" for v in row] for row in _heat_pivot.values],
+                texttemplate="%{text}",
+                hovertemplate="Perfil: %{y}<br>Faixa: %{x}<br>Itens: %{z}<extra></extra>",
+                showscale=False,
+            ))
+            _fig_mix.update_layout(
+                height=max(260, 42 * len(_heat_pivot) + 80),
+                margin=dict(l=0, r=0, t=10, b=0),
+                paper_bgcolor="#fff",
+            )
+            apply_ptbr(_fig_mix)
+            st.plotly_chart(_fig_mix, use_container_width=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAINEL 7 — VENDEDORES
 # ═════════════════════════════════════════════════════════════════════════════
 
 elif painel == "Vendedores":
