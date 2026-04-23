@@ -17,8 +17,15 @@ _KELVINS_URL = (
     "main/csv/municipios.csv"
 )
 _IBGE_POP_URL = (
-    "https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/2022/"
-    "variaveis/9324?localidades=N6[all]"
+    "https://servicodados.ibge.gov.br/api/v3/agregados/4714/periodos/2022/"
+    "variaveis/93?localidades=N6[all]"
+)
+# Tabela 5938 var 37 = PIB total a preços correntes (Mil Reais).
+# PIB per capita é calculado como (PIB_total_mil_reais * 1000) / populacao
+# pois o IBGE não expõe per capita diretamente nessa tabela.
+_IBGE_PIB_URL = (
+    "https://servicodados.ibge.gov.br/api/v3/agregados/5938/periodos/2021/"
+    "variaveis/37?localidades=N6[all]"
 )
 
 FAIXAS = [
@@ -167,15 +174,67 @@ def _baixar_municipios() -> pd.DataFrame:
     except Exception:
         df["populacao"] = None
 
-    cols = ["cidade_norm", "uf", "lat", "lon", "populacao", "cidade_orig", "ibge_codigo"]
+    # PIB total (Sidra 5938, variável 37 — Mil Reais a preços correntes).
+    # PIB per capita é derivado = (pib_total * 1000) / populacao.
+    try:
+        pib_resp = requests.get(_IBGE_PIB_URL, timeout=60)
+        pib_resp.raise_for_status()
+        pib_data = pib_resp.json()
+        pib_rows = []
+        for item in pib_data[0]["resultados"][0]["series"]:
+            cod = str(item["localidade"]["id"]).zfill(7)
+            serie = item["serie"]
+            pib = None
+            for ano in sorted(serie.keys(), reverse=True):
+                try:
+                    pib = float(str(serie[ano]).replace("...", "").replace(",", ".").strip())
+                    break
+                except (ValueError, AttributeError, TypeError):
+                    continue
+            pib_rows.append({"ibge_codigo": cod, "pib_total_mil_r": pib})
+        df_pib = pd.DataFrame(pib_rows)
+        df = df.merge(df_pib, on="ibge_codigo", how="left")
+        df["pib_total_mil_r"] = pd.to_numeric(df["pib_total_mil_r"], errors="coerce")
+        pop_num = pd.to_numeric(df["populacao"], errors="coerce")
+        df["pib_per_capita"] = (df["pib_total_mil_r"] * 1000.0) / pop_num.where(pop_num > 0)
+    except Exception:
+        df["pib_total_mil_r"] = None
+        df["pib_per_capita"] = None
+
+    cols = ["cidade_norm", "uf", "lat", "lon", "populacao", "pib_total_mil_r",
+            "pib_per_capita", "cidade_orig", "ibge_codigo"]
     return df[[c for c in cols if c in df.columns]].copy()
 
 
 @st.cache_data(ttl=30 * 86400, show_spinner=False)
 def carregar_municipios_ibge() -> pd.DataFrame:
-    """Carrega de parquet local (30 dias de cache) ou baixa e salva."""
+    """Carrega de parquet local (30 dias de cache) ou baixa e salva.
+
+    Auto-heal: se o parquet existe mas a coluna `populacao` está toda vazia
+    (caches gerados quando o endpoint IBGE estava fora do ar), tenta re-baixar
+    silenciosamente. Se o novo download tiver população, substitui o cache.
+    """
     if GEO_CACHE_PATH.exists():
-        return pd.read_parquet(GEO_CACHE_PATH)
+        df = pd.read_parquet(GEO_CACHE_PATH)
+        precisa_refresh = (
+            "populacao" not in df.columns
+            or pd.to_numeric(df["populacao"], errors="coerce").notna().sum() == 0
+            or "pib_per_capita" not in df.columns
+            or pd.to_numeric(df.get("pib_per_capita"), errors="coerce").notna().sum() == 0
+        )
+        if precisa_refresh:
+            try:
+                df_novo = _baixar_municipios()
+                pop_ok = pd.to_numeric(
+                    df_novo.get("populacao"), errors="coerce"
+                ).notna().sum() > 0
+                if pop_ok:
+                    df_novo.to_parquet(GEO_CACHE_PATH, index=False)
+                    return df_novo
+            except Exception:
+                pass  # Fallback: segue com o parquet antigo
+        return df
+
     df = _baixar_municipios()
     GEO_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(GEO_CACHE_PATH, index=False)
@@ -187,8 +246,11 @@ def enriquecer_carteira_geo(df_cart: pd.DataFrame) -> pd.DataFrame:
     muni = carregar_municipios_ibge()
     out = df_cart.copy()
     out["_cidade_norm"] = out["cidade"].map(normalizar_nome_cidade)
+    cols_muni = ["cidade_norm", "uf", "lat", "lon", "populacao"]
+    if "pib_per_capita" in muni.columns:
+        cols_muni.append("pib_per_capita")
     out = out.merge(
-        muni[["cidade_norm", "uf", "lat", "lon", "populacao"]],
+        muni[cols_muni],
         left_on=["_cidade_norm", "uf"],
         right_on=["cidade_norm", "uf"],
         how="left",
@@ -220,3 +282,68 @@ def classificar_tipologia(grupo) -> str:
     if grupo is None or (isinstance(grupo, float) and pd.isna(grupo)) or str(grupo).strip() == "":
         return "Sem classificação"
     return _MAPA_TIPOLOGIA.get(str(grupo).upper().strip(), "Sem classificação")
+
+
+def zonas_brancas_no_raio(
+    df_cart_agg: pd.DataFrame,
+    raio_km: float,
+    center_lat: float = SEDE_LAT,
+    center_lon: float = SEDE_LON,
+    pop_min: int = 5000,
+) -> pd.DataFrame:
+    """Cidades IBGE dentro do raio que não aparecem na carteira.
+
+    df_cart_agg: precisa ter colunas `cidade` e `uf` (já agregado).
+    Retorna DataFrame com cidade, uf, lat, lon, populacao, distancia_km,
+    ordenado por população desc. Filtra por `pop_min` para eliminar ruído
+    (centenas de distritos minúsculos).
+    """
+    muni = carregar_municipios_ibge().copy()
+    if muni.empty:
+        return pd.DataFrame(columns=[
+            "cidade", "uf", "lat", "lon", "populacao", "distancia_km",
+        ])
+
+    muni["distancia_km"] = muni.apply(
+        lambda r: haversine_km(
+            float(r["lat"]), float(r["lon"]), center_lat, center_lon
+        ) if pd.notna(r.get("lat")) and pd.notna(r.get("lon")) else None,
+        axis=1,
+    )
+    dentro = muni[
+        muni["distancia_km"].notna()
+        & (muni["distancia_km"] <= raio_km)
+    ].copy()
+
+    if df_cart_agg is not None and not df_cart_agg.empty:
+        atendidas = df_cart_agg.assign(
+            _cidade_norm=df_cart_agg["cidade"].map(normalizar_nome_cidade),
+        )[["_cidade_norm", "uf"]].drop_duplicates()
+        atendidas = atendidas.rename(columns={"_cidade_norm": "cidade_norm"})
+        dentro = dentro.merge(
+            atendidas.assign(_atendida=True),
+            on=["cidade_norm", "uf"],
+            how="left",
+        )
+        brancas = dentro[dentro["_atendida"].isna()].copy()
+    else:
+        brancas = dentro.copy()
+
+    brancas = brancas.rename(columns={"cidade_orig": "cidade"})
+    if "populacao" in brancas.columns:
+        brancas["populacao"] = pd.to_numeric(brancas["populacao"], errors="coerce")
+    else:
+        brancas["populacao"] = pd.NA
+
+    # Fallback: se população não está disponível para nenhuma cidade (IBGE
+    # indisponível na hora de gerar o cache), não filtra por pop_min — ordena
+    # por distância para que o usuário veja as mais próximas primeiro.
+    tem_populacao = brancas["populacao"].notna().any()
+    if tem_populacao:
+        brancas = brancas[brancas["populacao"].fillna(0) >= pop_min]
+        brancas = brancas.sort_values("populacao", ascending=False)
+    else:
+        brancas = brancas.sort_values("distancia_km", ascending=True)
+
+    cols = ["cidade", "uf", "lat", "lon", "populacao", "distancia_km"]
+    return brancas[[c for c in cols if c in brancas.columns]].reset_index(drop=True)

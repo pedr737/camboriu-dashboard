@@ -193,13 +193,132 @@ def botao_csv(df: pd.DataFrame, nome: str, label: str = "Exportar CSV", key: str
     st.download_button(label, csv, f"{nome}.csv", "text/csv", key=key)
 
 
-def calcular_score_rfv(df: pd.DataFrame) -> pd.DataFrame:
-    """Score RFV composto aplicado sobre qualquer subset da carteira.
+# Mapeamentos para o export Trello-ready
+_TRELLO_STATUS_LABEL = {
+    "em_risco":            "Em risco",
+    "hibernando":          "Hibernando",
+    "hibernando_sazonal":  "Hibernando",
+    "perdido":             "Perdido",
+    "ativo":               "Ativo",
+}
+_TRELLO_STATUS_ACAO = {
+    "em_risco":            "Janela curta — ligar em 7 dias",
+    "hibernando":          "Visita/call estruturada em 30 dias",
+    "hibernando_sazonal":  "Acompanhar retorno na próxima temporada",
+    "perdido":             "Oferta-âncora + carta executiva em 30 dias",
+    "ativo":               "Manutenção no ciclo regular",
+}
 
-    Score = 0.5·V + 0.3·F + 0.2·R_inv
+
+def _val(v) -> str:
+    """String limpa ou '—' para nulos/vazios/NaN — para descrições Trello.
+    Datas são reduzidas a AAAA-MM-DD (remove 00:00:00 supérfluo)."""
+    if v is None:
+        return "—"
+    if isinstance(v, float) and pd.isna(v):
+        return "—"
+    if isinstance(v, (pd.Timestamp,)):
+        return "—" if pd.isna(v) else v.strftime("%Y-%m-%d")
+    s = str(v).strip()
+    return s if s and s.lower() != "nan" else "—"
+
+
+def montar_df_trello(df_fila: pd.DataFrame) -> pd.DataFrame:
+    """Transforma uma fila (com id, nome_exibicao, vendedor, status_cliente,
+    camada, valor_total_r, ticket_medio_r, total_compras, dias_sem_compra,
+    ultima_compra, cidade, uf, documento_norm) no formato que o Blue Cat
+    Imports (importer CSV do Trello) consome diretamente.
+
+    Colunas de saída: Card Name, List Name, Labels, Members, Card Description.
+    """
+    if df_fila.empty:
+        return pd.DataFrame(columns=[
+            "Card Name", "List Name", "Labels", "Members", "Card Description"
+        ])
+
+    df = df_fila.copy()
+
+    # Enriquecimento com contatos (via load_contatos, cache 1h)
+    try:
+        contatos = load_contatos()
+        df = df.merge(contatos, on="id", how="left")
+    except Exception:
+        for c in ("email", "telefone", "celular", "whatsapp"):
+            df[c] = ""
+
+    def _melhor_tel(r):
+        for col in ("whatsapp", "celular", "telefone"):
+            v = r.get(col)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return "—"
+
+    def _labels(r):
+        st_lbl = _TRELLO_STATUS_LABEL.get(r.get("status_cliente"), "")
+        cam    = str(r.get("camada", "")).split(" — ")[0].strip()  # "A — Alto valor" → "A"
+        return ", ".join([x for x in [st_lbl, f"Camada {cam}" if cam else ""] if x])
+
+    def _desc(r):
+        tel = _melhor_tel(r)
+        linhas = [
+            f"Vendedor: {_val(r.get('vendedor'))}",
+            f"Ação: {_TRELLO_STATUS_ACAO.get(r.get('status_cliente'), '—')}",
+            "",
+            f"LTV: R$ {float(r.get('valor_total_r') or 0):,.0f}".replace(",", "."),
+            f"Ticket médio: R$ {float(r.get('ticket_medio_r') or 0):,.0f}".replace(",", "."),
+            f"Total compras: {int(r.get('total_compras') or 0)}",
+            f"Dias sem comprar: {int(r.get('dias_sem_compra') or 0)}",
+            f"Última compra: {_val(r.get('ultima_compra'))}",
+            "",
+            f"Cidade: {_val(r.get('cidade'))}/{_val(r.get('uf'))}",
+            f"Documento: {_val(r.get('documento_norm'))}",
+            "",
+            f"Contato principal: {tel}",
+            f"E-mail: {_val(r.get('email'))}",
+            f"Telefone: {_val(r.get('telefone'))}",
+            f"Celular: {_val(r.get('celular'))}",
+            f"WhatsApp: {_val(r.get('whatsapp'))}",
+        ]
+        return "\n".join(linhas)
+
+    return pd.DataFrame({
+        "Card Name":        df["nome_exibicao"],
+        "List Name":        "A Contatar",        # todos entram na coluna inicial
+        "Labels":           df.apply(_labels, axis=1),
+        "Members":          "",                   # atribuição manual no Trello
+        "Card Description": df.apply(_desc, axis=1),
+    })
+
+
+def botao_csv_trello(df_fila: pd.DataFrame, nome: str,
+                     label: str = "Exportar para Trello (CSV)",
+                     key: str | None = None):
+    """Botão paralelo ao botao_csv. Gera CSV pronto para o Blue Cat Imports
+    (power-up de import CSV do Trello). Requer que no board Trello existam:
+    • Lista `A Contatar`
+    • Labels `Em risco`, `Hibernando`, `Perdido`, `Camada A` (ou B/C)
+    """
+    df_trello = montar_df_trello(df_fila)
+    # CSV padrão Trello: separador vírgula, UTF-8 BOM (Excel-friendly),
+    # aspas automáticas para proteger descrições multilinha.
+    csv = df_trello.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        label, csv, f"{nome}_trello.csv", "text/csv", key=key,
+        help=(
+            "Formato pronto para o Blue Cat Imports. "
+            "No Trello: •••  → Imports → upload do arquivo. "
+            "Requer que o board já tenha a lista 'A Contatar' e as labels "
+            "'Em risco', 'Hibernando', 'Perdido' e 'Camada A/B/C' criadas."
+        ),
+    )
+
+
+def calcular_score_rfv(df: pd.DataFrame) -> pd.DataFrame:
+    """Score VF composto (Valor + Frequência) aplicado sobre qualquer subset.
+
+    Score = 0.7·V + 0.3·F
       - V = ticket_medio / média_do_segmento  (cap 3)
       - F = total_compras / mediana_do_segmento (cap 3)
-      - R_inv = max(0, 1 - dias_sem_compra/365)
 
     Modificador sazonal: +0.2 em Out–Dez para clientes com perfil "Sazonal".
 
@@ -207,6 +326,13 @@ def calcular_score_rfv(df: pd.DataFrame) -> pd.DataFrame:
       - A — Alto valor (Top 5%)
       - B — Médio valor (6 a 20%)
       - C — Base (restante)
+
+    Nota — antes essa função aplicava RFV clássico (0.5·V + 0.3·F + 0.2·R_inv).
+    O R foi removido porque a matriz "camada × status" usa status como eixo, e
+    status é 100% recência. Manter R no score causava dupla contagem parcial:
+    clientes valiosos mas parados caíam de camada por terem R_inv baixo,
+    esvaziando artificialmente células críticas como "A × Perdido". O nome
+    `calcular_score_rfv` foi mantido para retrocompatibilidade de chamadas.
     """
     df = df.copy()
     if "segmento" not in df.columns or df.empty:
@@ -219,9 +345,15 @@ def calcular_score_rfv(df: pd.DataFrame) -> pd.DataFrame:
 
     df["v_norm"] = (df["ticket_medio_r"] / tm_seg).clip(upper=3).fillna(0)
     df["f_norm"] = (df["total_compras"] / f_seg).clip(upper=3).fillna(0)
-    # Quem não comprou ainda (sem_compra) → dias_sem_compra NaN → r_inv = 0
+    # r_inv mantido no DataFrame para compat com código que lê a coluna,
+    # mas não entra mais no score. Ver nota na docstring.
     df["r_inv"]  = (1 - df["dias_sem_compra"] / 365).clip(lower=0).fillna(0)
-    df["score"]  = 0.5 * df["v_norm"] + 0.3 * df["f_norm"] + 0.2 * df["r_inv"]
+
+    # ── Score atual (VF): V=70% + F=30%, sem recência ───────────────────────
+    df["score"]  = 0.7 * df["v_norm"] + 0.3 * df["f_norm"]
+
+    # ── Score antigo (RFV clássico) — mantido comentado para reversão ───────
+    # df["score"]  = 0.5 * df["v_norm"] + 0.3 * df["f_norm"] + 0.2 * df["r_inv"]
 
     hoje = pd.Timestamp.now()
     if hoje.month in (10, 11, 12) and "perfil_sazonalidade" in df.columns:
@@ -441,16 +573,19 @@ def load_novos():
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_cidades_pe():
     df = qry("""
-        SELECT dc.cidade_norm AS cidade,
+        SELECT dc.cidade_norm                      AS cidade,
+               COALESCE(dc.segmento_predominante,
+                        fv.tabela_preco,
+                        'Sem Segmento')            AS segmento,
                COUNT(DISTINCT dc.id)               AS clientes,
-               COUNT(fv.id)                         AS vendas,
+               COUNT(fv.id)                        AS vendas,
                ROUND(SUM(fv.valor_total_liquido)::numeric/100,0)::float AS valor_r
         FROM dim_clientes dc
         JOIN fato_vendas fv ON fv.cliente_id = dc.id
         WHERE dc.estado_norm = 'PE'
           AND fv.status_venda IN ('Fechada','Fechado')
           AND dc.cidade_norm IS NOT NULL
-        GROUP BY 1 ORDER BY 3 DESC LIMIT 25
+        GROUP BY 1, 2
     """)
     return df
 
@@ -668,6 +803,16 @@ def load_cohort_segmento():
     """)
     df["mes_entrada"] = pd.to_datetime(df["mes_entrada"])
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_contatos() -> pd.DataFrame:
+    """Email/telefone/celular/whatsapp por cliente. Usado na exportação
+    Trello-ready — não entra na carteira principal (evita poluir o df em memória)."""
+    return qry("""
+        SELECT id, email, telefone, celular, whatsapp
+        FROM dim_clientes
+    """)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1004,7 +1149,15 @@ if painel == "Executivo":
 
     # ── Cidades PE ────────────────────────────────────────────────────────
     st.subheader("Distribuição de clientes em Pernambuco — Top 20 cidades")
-    pe_top = df_pe.head(20)
+    _df_pe_filt = seg(df_pe)  # aplica filtro global de segmento
+    _df_pe_agg = (
+        _df_pe_filt.groupby("cidade", as_index=False)
+        .agg(clientes=("clientes", "sum"),
+             vendas=("vendas", "sum"),
+             valor_r=("valor_r", "sum"))
+        .sort_values("vendas", ascending=False)
+    )
+    pe_top = _df_pe_agg.head(20)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(
@@ -1695,7 +1848,7 @@ elif painel == "Estratégia de Carteira":
     st.title("Estratégia de Carteira")
     st.caption(
         "Decide onde investir atenção: quem manter, quem reativar, quem recuperar "
-        "e quem monitorar. Cruza o valor do cliente (score RFV) com o status atual."
+        "e quem monitorar. Cruza o valor do cliente (score VF) com o status atual."
     )
 
     # ── Calcula score RFV sobre TODA a carteira ativa ────────────────────
@@ -1776,18 +1929,22 @@ elif painel == "Estratégia de Carteira":
         unsafe_allow_html=True,
     )
 
-    with st.expander("Metodologia: score RFV, status e matriz de ação", expanded=False):
+    with st.expander("Metodologia: score de valor, status e matriz de ação", expanded=False):
         st.markdown("""
 <div style='font-size:0.88rem; line-height:1.6; color:#333;'>
 
-<b>Score RFV</b> combina três dimensões que indicam o quanto um cliente está
-engajado com a empresa:
+<b>Score de valor</b> mede o quanto um cliente vale para a empresa,
+independentemente de quando ele comprou pela última vez:
 
 <ul style='margin-top:6px; margin-bottom:10px;'>
-<li><b>Valor (peso 50%)</b> — quanto ele gasta por compra, comparado à média do segmento dele</li>
+<li><b>Valor (peso 70%)</b> — quanto ele gasta por compra, comparado à média do segmento dele</li>
 <li><b>Frequência (peso 30%)</b> — quantas compras fez, comparado à mediana do segmento</li>
-<li><b>Recência (peso 20%)</b> — quanto tempo faz que comprou (mais recente = melhor)</li>
 </ul>
+
+A recência <b>não</b> entra aqui — fica no eixo de status da matriz. Assim, um
+cliente de alto ticket que ficou parado não "perde pontos de valor" por estar
+parado: ele aparece em <b>A × Perdido</b>, que é exatamente o alvo da
+recuperação prioritária.
 
 Em Out–Dez, clientes com perfil sazonal ganham bônus de prioridade — é a janela
 natural de compra deles.
@@ -1972,7 +2129,7 @@ padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
         )
     else:
         st.subheader("Fila completa — carteira ativa")
-        st.caption("Toda a base ativa ordenada por score RFV. Clique em uma "
+        st.caption("Toda a base ativa ordenada por score de valor (VF). Clique em uma "
                    "célula da matriz para filtrar.")
 
     fila = base_rfv.copy()
@@ -2055,13 +2212,29 @@ padrão e <b>C</b> é baixa prioridade (normalmente resolvido com automação).
         if sel:
             csv_nome = ("fila_" + ACAO_MATRIZ[sel]
                         .lower().replace(" ", "_").replace("ã","a").replace("é","e"))
-        botao_csv(
-            fila[["nome_exibicao", "segmento", "cidade", "uf", "vendedor",
-                  "status_cliente", "camada", "score", "ultima_compra",
-                  "dias_sem_compra", "total_compras",
-                  "valor_total_r", "ticket_medio_r"]],
-            csv_nome, "Exportar fila (CSV)", key="csv_fila_estrat",
-        )
+
+        _col_csv1, _col_csv2 = st.columns([1, 1])
+        with _col_csv1:
+            botao_csv(
+                fila[["nome_exibicao", "segmento", "cidade", "uf", "vendedor",
+                      "status_cliente", "camada", "score", "ultima_compra",
+                      "dias_sem_compra", "total_compras",
+                      "valor_total_r", "ticket_medio_r"]],
+                csv_nome, "Exportar fila (CSV)", key="csv_fila_estrat",
+            )
+        with _col_csv2:
+            # Export Trello-ready precisa das colunas de identificação (id,
+            # documento_norm) para enriquecimento com contatos.
+            _fila_trello = fila[[
+                "id", "nome_exibicao", "vendedor", "status_cliente", "camada",
+                "valor_total_r", "ticket_medio_r", "total_compras",
+                "dias_sem_compra", "ultima_compra", "cidade", "uf",
+                "documento_norm",
+            ]].copy()
+            botao_csv_trello(
+                _fila_trello, csv_nome,
+                "Exportar para Trello (CSV)", key="csv_fila_estrat_trello",
+            )
 
     # ── Maximização de receita ───────────────────────────────────────────
     st.markdown(
@@ -2472,8 +2645,9 @@ elif painel == "Demografia":
     from geo import (
         enriquecer_carteira_geo, classificar_faixa, classificar_tipologia,
         ORDEM_FAIXAS, ORDEM_TIPOLOGIAS, CORES_TIPOLOGIA, CORES_FAIXA,
-        SEDE_LAT, SEDE_LON, circle_points_km,
+        SEDE_LAT, SEDE_LON, circle_points_km, zonas_brancas_no_raio,
     )
+    import math
 
     try:
         with st.spinner("Carregando dados geográficos..."):
@@ -2592,129 +2766,378 @@ elif painel == "Demografia":
     )
 
     st.divider()
-    st.subheader("Mapa de presença")
+    st.subheader("Mapa de penetração")
 
     _mapa_base = df_ativos.dropna(subset=["lat", "lon"]).copy()
     if _mapa_base.empty:
         st.info("Nenhum cliente com geolocalização encontrada.")
     else:
-        _mapa_agg = (
-            _mapa_base
-            .groupby(["cidade", "uf", "lat", "lon"], as_index=False)
-            .agg(
-                n_clientes=("id", "count"),
-                ltv=("valor_total_r", "sum"),
-                ticket_medio=("ticket_medio_r", "mean"),
+        # ── controles do mapa ──────────────────────────────────────────────
+        # Segmento é controlado exclusivamente pelo filtro global da sidebar
+        # (antes havia radio local que sobrescrevia e gerava confusão).
+        _ctrl_c1, _ctrl_c2 = st.columns([1, 1])
+        with _ctrl_c1:
+            _mapa_modo = st.radio(
+                "Intensidade",
+                ["Clientes", "LTV", "Ticket médio"],
+                horizontal=True,
+                key="radio_cor_mapa",
             )
-        )
-        _tip_pred = (
-            _mapa_base.groupby(["cidade", "uf"])["tipologia"]
-            .agg(lambda x: x.value_counts().index[0] if len(x) else "Sem classificação")
-            .reset_index()
-            .rename(columns={"tipologia": "tipologia_pred"})
-        )
-        _mapa_agg = _mapa_agg.merge(_tip_pred, on=["cidade", "uf"], how="left")
-        _mapa_modo = st.radio(
-            "Mapa",
-            ["Calor por LTV", "Calor por clientes"],
-            horizontal=True,
-            key="radio_cor_mapa",
-        )
-        _z_col = "ltv" if _mapa_modo == "Calor por LTV" else "n_clientes"
-        _z_title = "LTV (R$)" if _z_col == "ltv" else "Clientes"
-        _raio_medio = (
-            (_mapa_base["distancia_km"] * _mapa_base["valor_total_r"]).sum()
-            / _mapa_base["valor_total_r"].sum()
-        ) if _mapa_base["distancia_km"].notna().any() and _mapa_base["valor_total_r"].sum() > 0 else None
-
-        _fig_mapa = px.density_mapbox(
-            _mapa_agg,
-            lat="lat",
-            lon="lon",
-            z=_z_col,
-            radius=34 if _z_col == "ltv" else 28,
-            center={"lat": -14.0, "lon": -50.0},
-            zoom=2.6,
-            mapbox_style="carto-positron",
-            color_continuous_scale=[
-                [0.0, "#e8f1ff"],
-                [0.25, "#a8c8ff"],
-                [0.50, "#5b96f7"],
-                [0.75, "#1e63d6"],
-                [1.0, "#0d3b8e"],
-            ],
-            hover_data=None,
-        )
-        _fig_mapa.update_traces(opacity=0.85, showscale=True)
-
-        _hover_size = (_mapa_agg["n_clientes"].clip(lower=1) ** 0.45) * 8 + 4
-        _fig_mapa.add_trace(go.Scattermapbox(
-            lat=_mapa_agg["lat"],
-            lon=_mapa_agg["lon"],
-            mode="markers",
-            marker=dict(size=_hover_size, color="rgba(13,59,142,0.18)"),
-            text=_mapa_agg.apply(
-                lambda r: (
-                    f"{r['cidade']}/{r['uf']}<br>"
-                    f"Clientes: {fmt_num(r['n_clientes'])}<br>"
-                    f"LTV: {fmt_brl(r['ltv'], compact=True)}<br>"
-                    f"Ticket médio: {fmt_brl(r['ticket_medio'])}<br>"
-                    f"Perfil dominante: {r['tipologia_pred']}"
+        with _ctrl_c2:
+            _viz_modo = st.radio(
+                "Visualização",
+                ["Ambos", "Calor", "Pontos"],
+                horizontal=True,
+                key="radio_viz_mapa",
+                help=(
+                    "Calor: densidade agregada (melhor para leitura panorâmica). "
+                    "Pontos: um marcador por cidade (sempre visível, resistente a zoom). "
+                    "Ambos: camadas sobrepostas."
                 ),
-                axis=1,
-            ),
-            hovertemplate="%{text}<extra></extra>",
-            name="Cidades",
-            showlegend=False,
-        ))
+            )
 
-        if _raio_medio and _raio_medio > 0:
-            _circle_lat, _circle_lon = circle_points_km(SEDE_LAT, SEDE_LON, float(_raio_medio))
+        _seg_label = (
+            {"1 - Atacado": "Atacado", "2 - Varejo": "Varejo",
+             "5 - Atacarejo": "Atacarejo"}.get(seg_filter, "Geral")
+        )
+        _mapa_filtrado = _mapa_base.copy()  # já veio filtrado via seg() no df_geo
+
+        if _mapa_filtrado.empty:
+            st.info(f"Nenhum cliente do segmento **{_seg_label}** com geolocalização.")
+        else:
+            # ── agregação por cidade (1 ponto por cidade, evita mancha) ────
+            _mapa_agg = (
+                _mapa_filtrado
+                .groupby(["cidade", "uf", "lat", "lon"], as_index=False)
+                .agg(
+                    n_clientes=("id", "count"),
+                    ltv=("valor_total_r", "sum"),
+                    ticket_medio=("ticket_medio_r", "mean"),
+                )
+            )
+            _tip_pred = (
+                _mapa_filtrado.groupby(["cidade", "uf"])["tipologia"]
+                .agg(lambda x: x.value_counts().index[0] if len(x) else "Sem classificação")
+                .reset_index()
+                .rename(columns={"tipologia": "tipologia_pred"})
+            )
+            _mapa_agg = _mapa_agg.merge(_tip_pred, on=["cidade", "uf"], how="left")
+
+            # ── métricas de penetração ─────────────────────────────────────
+            _pm1, _pm2, _pm3 = st.columns(3)
+            _pm1.metric("Clientes mapeados", fmt_num(len(_mapa_filtrado)))
+            _pm2.metric("Cidades alcançadas", fmt_num(_mapa_agg["cidade"].nunique()))
+            _pm3.metric("Ticket médio", fmt_brl(_mapa_filtrado["ticket_medio_r"].mean()))
+
+            # ── heatmap agregado por cidade ────────────────────────────────
+            _z_map = {
+                "Clientes":     ("n_clientes",   "Clientes"),
+                "LTV":          ("ltv",          "LTV (R$)"),
+                "Ticket médio": ("ticket_medio", "Ticket médio (R$)"),
+            }
+            _z_col, _z_title = _z_map[_mapa_modo]
+
+            _raio_medio = (
+                (_mapa_filtrado["distancia_km"] * _mapa_filtrado["valor_total_r"]).sum()
+                / _mapa_filtrado["valor_total_r"].sum()
+            ) if _mapa_filtrado["distancia_km"].notna().any() and _mapa_filtrado["valor_total_r"].sum() > 0 else None
+
+            # Transformação log: comprime a escala para que cidades com poucos
+            # clientes não caiam em ~0 numa escala dominada por Santa Cruz.
+            _raw = _mapa_agg[_z_col].fillna(0).astype(float).clip(lower=0)
+            _mapa_agg["_z_log"] = _raw.map(lambda v: math.log1p(v))
+            _log_max = max(_mapa_agg["_z_log"].max(), 1e-9)
+
+            _COLORSCALE = [
+                [0.00, "#2b83ba"],
+                [0.25, "#abdda4"],
+                [0.50, "#ffffbf"],
+                [0.75, "#fdae61"],
+                [1.00, "#d7191c"],
+            ]
+
+            # Centro e zoom ajustados ao segmento exibido (em vez do BR inteiro,
+            # que escondia dispersão fora de PE). Mantém dentro de faixa razoável.
+            _lat_c = float(_mapa_agg["lat"].mean())
+            _lon_c = float(_mapa_agg["lon"].mean())
+            _lat_span = float(_mapa_agg["lat"].max() - _mapa_agg["lat"].min())
+            _lon_span = float(_mapa_agg["lon"].max() - _mapa_agg["lon"].min())
+            _span = max(_lat_span, _lon_span, 0.1)
+            _zoom_inicial = max(3.2, min(7.0, 8.5 - math.log2(_span + 1) * 1.6))
+
+            _fig_mapa = go.Figure()
+
+            # ── CAMADA 1: calor (opcional) ─────────────────────────────────
+            if _viz_modo in ("Ambos", "Calor"):
+                _fig_mapa.add_trace(go.Densitymapbox(
+                    lat=_mapa_agg["lat"],
+                    lon=_mapa_agg["lon"],
+                    z=_mapa_agg["_z_log"],
+                    radius=28,
+                    colorscale=_COLORSCALE,
+                    zmin=0,
+                    zmax=_log_max,
+                    opacity=0.55 if _viz_modo == "Ambos" else 0.85,
+                    showscale=(_viz_modo == "Calor"),
+                    colorbar=dict(
+                        title=f"{_z_title} (log)",
+                        tickvals=[0, _log_max * 0.5, _log_max],
+                        ticktext=["baixo", "médio", "alto"],
+                    ),
+                    hoverinfo="skip",
+                    name="Densidade",
+                ))
+
+            # ── CAMADA 2: pontos por cidade (sempre visível, resistente a zoom)
+            if _viz_modo in ("Ambos", "Pontos"):
+                _size_base = _raw.pow(0.5)  # sqrt comprime sem zerar pequenos
+                _size_max = max(_size_base.max(), 1e-9)
+                _marker_size = 6 + (_size_base / _size_max) * 26  # 6–32 px
+
+                _fig_mapa.add_trace(go.Scattermapbox(
+                    lat=_mapa_agg["lat"],
+                    lon=_mapa_agg["lon"],
+                    mode="markers",
+                    marker=dict(
+                        size=_marker_size,
+                        color=_mapa_agg["_z_log"],
+                        colorscale=_COLORSCALE,
+                        cmin=0,
+                        cmax=_log_max,
+                        opacity=0.78,
+                        showscale=(_viz_modo == "Pontos"),
+                        colorbar=dict(
+                            title=f"{_z_title} (log)",
+                            tickvals=[0, _log_max * 0.5, _log_max],
+                            ticktext=["baixo", "médio", "alto"],
+                        ) if _viz_modo == "Pontos" else None,
+                    ),
+                    text=_mapa_agg.apply(
+                        lambda r: (
+                            f"<b>{r['cidade']}/{r['uf']}</b><br>"
+                            f"Clientes: {fmt_num(r['n_clientes'])}<br>"
+                            f"LTV: {fmt_brl(r['ltv'], compact=True)}<br>"
+                            f"Ticket médio: {fmt_brl(r['ticket_medio'])}<br>"
+                            f"Perfil dominante: {r['tipologia_pred']}"
+                        ),
+                        axis=1,
+                    ),
+                    hovertemplate="%{text}<extra></extra>",
+                    name="Cidades atendidas",
+                    showlegend=False,
+                ))
+            else:
+                # Hover invisível quando modo = Calor
+                _fig_mapa.add_trace(go.Scattermapbox(
+                    lat=_mapa_agg["lat"],
+                    lon=_mapa_agg["lon"],
+                    mode="markers",
+                    marker=dict(size=16, color="rgba(0,0,0,0)"),
+                    text=_mapa_agg.apply(
+                        lambda r: (
+                            f"<b>{r['cidade']}/{r['uf']}</b><br>"
+                            f"Clientes: {fmt_num(r['n_clientes'])}<br>"
+                            f"LTV: {fmt_brl(r['ltv'], compact=True)}"
+                        ),
+                        axis=1,
+                    ),
+                    hovertemplate="%{text}<extra></extra>",
+                    showlegend=False,
+                ))
+
+            # ── CAMADA 3: zonas brancas dentro do raio ─────────────────────
+            _mostra_brancas = st.session_state.get("_mostra_zonas_brancas", True)
+            _pop_min = st.session_state.get("_pop_min_brancas", 10000)
+            _df_brancas = pd.DataFrame()
+            if _raio_medio and _raio_medio > 0:
+                try:
+                    _df_brancas = zonas_brancas_no_raio(
+                        _mapa_agg[["cidade", "uf"]],
+                        raio_km=float(_raio_medio),
+                        pop_min=int(_pop_min),
+                    )
+                except Exception:
+                    _df_brancas = pd.DataFrame()
+
+            _tem_pop = (
+                not _df_brancas.empty
+                and _df_brancas["populacao"].notna().any()
+            )
+            if _mostra_brancas and not _df_brancas.empty:
+                if _tem_pop:
+                    _bsize_base = _df_brancas["populacao"].fillna(0).astype(float).pow(0.5)
+                else:
+                    # Sem população: tamanho fixo por distância inversa
+                    _bsize_base = pd.Series([1.0] * len(_df_brancas))
+                _bsize_max = max(_bsize_base.max(), 1e-9)
+                _bmarker_size = 6 + (_bsize_base / _bsize_max) * 20  # 6–26 px
+
+                def _hover_branca(r):
+                    linhas = [f"<b>{r['cidade']}/{r['uf']}</b>"]
+                    if pd.notna(r.get("populacao")):
+                        linhas.append(f"População: {fmt_num(int(r['populacao']))}")
+                    linhas.append(f"Distância sede: {fmt_num(r['distancia_km'], 0)} km")
+                    linhas.append("<i>Oportunidade · cidade sem cliente</i>")
+                    return "<br>".join(linhas)
+
+                # Halo externo — anel translúcido que sugere "espaço vazio"
+                _fig_mapa.add_trace(go.Scattermapbox(
+                    lat=_df_brancas["lat"],
+                    lon=_df_brancas["lon"],
+                    mode="markers",
+                    marker=dict(
+                        size=_bmarker_size * 1.6,
+                        color="rgba(107, 114, 128, 0.18)",  # cinza neutro
+                        opacity=1.0,
+                    ),
+                    hoverinfo="skip",
+                    showlegend=False,
+                ))
+                # Miolo — marker âmbar (oportunidade, não alarme)
+                _fig_mapa.add_trace(go.Scattermapbox(
+                    lat=_df_brancas["lat"],
+                    lon=_df_brancas["lon"],
+                    mode="markers",
+                    marker=dict(
+                        size=_bmarker_size * 0.55,
+                        color="rgba(245, 158, 11, 0.85)",  # âmbar = oportunidade
+                        opacity=0.95,
+                    ),
+                    text=_df_brancas.apply(_hover_branca, axis=1),
+                    hovertemplate="%{text}<extra></extra>",
+                    name="Oportunidade (sem cliente)",
+                    showlegend=True,
+                ))
+
+            if _raio_medio and _raio_medio > 0:
+                _circle_lat, _circle_lon = circle_points_km(SEDE_LAT, SEDE_LON, float(_raio_medio))
+                _fig_mapa.add_trace(go.Scattermapbox(
+                    lat=_circle_lat,
+                    lon=_circle_lon,
+                    mode="lines",
+                    line=dict(color="rgba(11,79,159,0.70)", width=2),
+                    hovertemplate=f"Raio médio ponderado por LTV: {fmt_num(_raio_medio, 0)} km<extra></extra>",
+                    name="Raio médio",
+                ))
+
             _fig_mapa.add_trace(go.Scattermapbox(
-                lat=_circle_lat,
-                lon=_circle_lon,
-                mode="lines",
-                line=dict(color="rgba(11,79,159,0.70)", width=2),
-                hovertemplate=f"Raio médio: {fmt_num(_raio_medio, 0)} km<extra></extra>",
-                name="Raio médio",
+                lat=[SEDE_LAT],
+                lon=[SEDE_LON],
+                mode="markers+text",
+                text=["Sede"],
+                textposition="top right",
+                marker=dict(size=11, color="#111111"),
+                hovertemplate="Santa Cruz do Capibaribe/PE<extra></extra>",
+                name="Sede",
             ))
+            _fig_mapa.update_layout(
+                height=580,
+                margin=dict(l=0, r=0, t=10, b=0),
+                paper_bgcolor="#fff",
+                mapbox=dict(
+                    style="carto-positron",
+                    center={"lat": _lat_c, "lon": _lon_c},
+                    zoom=_zoom_inicial,
+                ),
+                legend=dict(orientation="h", y=-0.08),
+            )
+            apply_ptbr(_fig_mapa)
+            st.plotly_chart(_fig_mapa, use_container_width=True)
+            st.caption(
+                (
+                    f"Raio médio (ponderado por LTV) = {fmt_num(_raio_medio, 0)} km · "
+                    if _raio_medio else "Raio médio indisponível · "
+                )
+                + f"Visualização: **{_viz_modo}** · Segmento: **{_seg_label}** · "
+                + "Escala logarítmica (log1p) — evita que cidades de baixa densidade sumam."
+            )
 
-        _fig_mapa.add_trace(go.Scattermapbox(
-            lat=[SEDE_LAT],
-            lon=[SEDE_LON],
-            mode="markers+text",
-            text=["Sede"],
-            textposition="top right",
-            marker=dict(size=11, color="#111111"),
-            hovertemplate="Santa Cruz do Capibaribe/PE<extra></extra>",
-            name="Sede",
-        ))
-        _fig_mapa.update_layout(
-            height=560,
-            margin=dict(l=0, r=0, t=10, b=0),
-            paper_bgcolor="#fff",
-            coloraxis_colorbar=dict(title=_z_title),
-            legend=dict(orientation="h", y=-0.08),
-        )
-        apply_ptbr(_fig_mapa)
-        st.plotly_chart(_fig_mapa, use_container_width=True)
-        st.caption(
-            f"Raio médio = {fmt_num(_raio_medio, 0)} km."
-            if _raio_medio else
-            "Raio médio indisponível."
-        )
+            # ── controles de oportunidades + tabelas ───────────────────────
+            _tab_top, _tab_brancas = st.tabs(
+                ["Top cidades atendidas", "Oportunidades no raio"]
+            )
 
-        _cidades_top = _mapa_agg.sort_values("ltv", ascending=False).head(15).copy()
-        _cidades_top["Clientes"] = _cidades_top["n_clientes"].apply(fmt_num)
-        _cidades_top["LTV"] = _cidades_top["ltv"].apply(lambda v: fmt_brl(v, compact=True))
-        _cidades_top["Ticket médio"] = _cidades_top["ticket_medio"].apply(fmt_brl)
-        st.dataframe(
-            _cidades_top.rename(columns={
-                "cidade": "Cidade", "uf": "UF", "tipologia_pred": "Perfil dominante"
-            })[["Cidade", "UF", "Clientes", "LTV", "Ticket médio", "Perfil dominante"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+            with _tab_top:
+                _cidades_top = _mapa_agg.sort_values("ltv", ascending=False).head(15).copy()
+                _cidades_top["Clientes"] = _cidades_top["n_clientes"].apply(fmt_num)
+                _cidades_top["LTV"] = _cidades_top["ltv"].apply(lambda v: fmt_brl(v, compact=True))
+                _cidades_top["Ticket médio"] = _cidades_top["ticket_medio"].apply(fmt_brl)
+                st.dataframe(
+                    _cidades_top.rename(columns={
+                        "cidade": "Cidade", "uf": "UF", "tipologia_pred": "Perfil dominante"
+                    })[["Cidade", "UF", "Clientes", "LTV", "Ticket médio", "Perfil dominante"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with _tab_brancas:
+                _col_zb1, _col_zb2 = st.columns([1, 1])
+                with _col_zb1:
+                    st.checkbox(
+                        "Destacar oportunidades no mapa",
+                        value=True,
+                        key="_mostra_zonas_brancas",
+                    )
+                with _col_zb2:
+                    st.select_slider(
+                        "População mínima",
+                        options=[5000, 10000, 20000, 50000, 100000],
+                        value=10000,
+                        key="_pop_min_brancas",
+                        help=(
+                            "Filtra cidades pequenas. Elevar o mínimo foca em "
+                            "oportunidades com massa de mercado."
+                        ),
+                    )
+
+                if _df_brancas.empty:
+                    if not _raio_medio or _raio_medio <= 0:
+                        st.info(
+                            "Sem raio médio calculável para o segmento selecionado "
+                            "(faltam vendas com distância/LTV)."
+                        )
+                    else:
+                        st.success(
+                            f"Dentro do raio de {fmt_num(_raio_medio, 0)} km não há "
+                            f"cidades acima de {fmt_num(_pop_min)} habitantes sem cliente. "
+                            "Reduza o filtro de população ou expanda o raio."
+                        )
+                else:
+                    _mp1, _mp2, _mp3 = st.columns(3)
+                    _mp1.metric("Cidades sem cliente (no raio)", fmt_num(len(_df_brancas)))
+                    if _tem_pop:
+                        _pop_sem_penet = int(_df_brancas["populacao"].fillna(0).sum())
+                        _mp2.metric("População não atendida", fmt_num(_pop_sem_penet))
+                    else:
+                        _mp2.metric("População não atendida", "—",
+                                    help="Dados de população IBGE indisponíveis no cache.")
+                    _mp3.metric(
+                        "Raio analisado",
+                        f"{fmt_num(_raio_medio, 0)} km",
+                        help="Raio médio ponderado por LTV do segmento selecionado.",
+                    )
+
+                    _brancas_show = _df_brancas.head(25).copy()
+                    _brancas_show["População"] = _brancas_show["populacao"].apply(
+                        lambda v: fmt_num(int(v)) if pd.notna(v) else "—"
+                    )
+                    _brancas_show["Distância"] = _brancas_show["distancia_km"].apply(
+                        lambda v: f"{fmt_num(v, 0)} km"
+                    )
+                    st.dataframe(
+                        _brancas_show.rename(columns={
+                            "cidade": "Cidade", "uf": "UF",
+                        })[["Cidade", "UF", "População", "Distância"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Cidades do IBGE dentro do raio médio de penetração **sem "
+                        "nenhum cliente na carteira** — "
+                        + ("ordenadas por população (potencial de mercado não atendido)."
+                           if _tem_pop
+                           else "ordenadas por distância da sede.")
+                    )
 
     st.divider()
     st.subheader("Distribuição por distância")
