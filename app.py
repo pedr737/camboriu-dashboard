@@ -1506,23 +1506,33 @@ entre colunas.
             st.markdown("**Retenção média por trimestre de entrada — leitura de tendência**")
             fig = go.Figure()
             cores_m = {1: "#1A73E8", 3: "#34A853", 6: "#F9AB00"}
+            posicoes_m = {1: "top center", 3: "bottom center", 6: "bottom center"}
             for m in [1, 3, 6]:
                 if m in resumo_tri.columns:
+                    valores = resumo_tri[m]
+                    rotulos = [
+                        f"{v:.1f}%".replace(".", ",") if pd.notna(v) else ""
+                        for v in valores
+                    ]
                     fig.add_trace(go.Scatter(
-                        x=resumo_tri.index, y=resumo_tri[m],
-                        name=f"m+{m}", mode="lines+markers",
+                        x=resumo_tri.index, y=valores,
+                        name=f"m+{m}", mode="lines+markers+text",
                         line=dict(color=cores_m[m], width=2.5),
                         marker=dict(size=8),
+                        text=rotulos,
+                        textposition=posicoes_m[m],
+                        textfont=dict(size=12, color=cores_m[m]),
+                        cliponaxis=False,
                     ))
             fig.update_layout(
-                height=260, margin=dict(l=0,r=0,t=10,b=0),
+                height=280, margin=dict(l=0,r=0,t=20,b=0),
                 hovermode="x unified",
                 plot_bgcolor="#fff", paper_bgcolor="#fff",
                 legend=dict(orientation="h", y=-0.3, font_size=11),
                 xaxis_title="Trimestre de entrada do cohort",
                 yaxis_title="% retenção média",
             )
-            fig.update_yaxes(ticksuffix="%", gridcolor="#f0f0f0", rangemode="tozero")
+            fig.update_yaxes(ticksuffix="%", showgrid=False, rangemode="tozero")
             fig.update_xaxes(showgrid=False)
             apply_ptbr(fig)
             st.plotly_chart(fig, use_container_width=True)
@@ -2645,7 +2655,8 @@ elif painel == "Demografia":
     from geo import (
         enriquecer_carteira_geo, classificar_faixa, classificar_tipologia,
         ORDEM_FAIXAS, ORDEM_TIPOLOGIAS, CORES_TIPOLOGIA, CORES_FAIXA,
-        SEDE_LAT, SEDE_LON, circle_points_km, zonas_brancas_no_raio,
+        CORES_COBERTURA, SEDE_LAT, SEDE_LON, circle_points_km,
+        zonas_brancas_no_raio, carregar_leads_prospects,
     )
     import math
 
@@ -2766,173 +2777,269 @@ elif painel == "Demografia":
     )
 
     st.divider()
-    st.subheader("Mapa de penetração")
 
     _mapa_base = df_ativos.dropna(subset=["lat", "lon"]).copy()
     if _mapa_base.empty:
         st.info("Nenhum cliente com geolocalização encontrada.")
     else:
-        # ── controles do mapa ──────────────────────────────────────────────
-        # Segmento é controlado exclusivamente pelo filtro global da sidebar
-        # (antes havia radio local que sobrescrevia e gerava confusão).
-        _ctrl_c1, _ctrl_c2 = st.columns([1, 1])
-        with _ctrl_c1:
-            _mapa_modo = st.radio(
-                "Intensidade",
-                ["Clientes", "LTV", "Ticket médio"],
-                horizontal=True,
-                key="radio_cor_mapa",
-            )
-        with _ctrl_c2:
-            _viz_modo = st.radio(
-                "Visualização",
-                ["Ambos", "Calor", "Pontos"],
-                horizontal=True,
-                key="radio_viz_mapa",
-                help=(
-                    "Calor: densidade agregada (melhor para leitura panorâmica). "
-                    "Pontos: um marcador por cidade (sempre visível, resistente a zoom). "
-                    "Ambos: camadas sobrepostas."
-                ),
-            )
-
         _seg_label = (
             {"1 - Atacado": "Atacado", "2 - Varejo": "Varejo",
              "5 - Atacarejo": "Atacarejo"}.get(seg_filter, "Geral")
         )
-        _mapa_filtrado = _mapa_base.copy()  # já veio filtrado via seg() no df_geo
 
-        if _mapa_filtrado.empty:
-            st.info(f"Nenhum cliente do segmento **{_seg_label}** com geolocalização.")
-        else:
-            # ── agregação por cidade (1 ponto por cidade, evita mancha) ────
-            _mapa_agg = (
-                _mapa_filtrado
-                .groupby(["cidade", "uf", "lat", "lon"], as_index=False)
-                .agg(
-                    n_clientes=("id", "count"),
-                    ltv=("valor_total_r", "sum"),
-                    ticket_medio=("ticket_medio_r", "mean"),
+        # ── agregação por cidade (compartilhada entre Mapa A e Mapa B) ────
+        _agg_spec = {
+            "n_clientes": ("id", "count"),
+            "ltv": ("valor_total_r", "sum"),
+            "ticket_medio": ("ticket_medio_r", "mean"),
+        }
+        if "populacao" in _mapa_base.columns:
+            _agg_spec["populacao"] = ("populacao", "first")
+        if "pib_per_capita" in _mapa_base.columns:
+            _agg_spec["pib_per_capita"] = ("pib_per_capita", "first")
+        _mapa_agg = (
+            _mapa_base
+            .groupby(["cidade", "uf", "lat", "lon"], as_index=False)
+            .agg(**_agg_spec)
+        )
+        if "populacao" not in _mapa_agg.columns:
+            _mapa_agg["populacao"] = pd.NA
+        if "pib_per_capita" not in _mapa_agg.columns:
+            _mapa_agg["pib_per_capita"] = pd.NA
+        _tip_pred = (
+            _mapa_base.groupby(["cidade", "uf"])["tipologia"]
+            .agg(lambda x: x.value_counts().index[0] if len(x) else "Sem classificação")
+            .reset_index()
+            .rename(columns={"tipologia": "tipologia_pred"})
+        )
+        _mapa_agg = _mapa_agg.merge(_tip_pred, on=["cidade", "uf"], how="left")
+
+        _raio_medio = (
+            (_mapa_base["distancia_km"] * _mapa_base["valor_total_r"]).sum()
+            / _mapa_base["valor_total_r"].sum()
+        ) if _mapa_base["distancia_km"].notna().any() and _mapa_base["valor_total_r"].sum() > 0 else None
+
+        # Leads (Google Places) — carregados 1x, filtrados por tipo
+        try:
+            _df_leads = carregar_leads_prospects()
+        except Exception:
+            _df_leads = pd.DataFrame()
+        _leads_zb = _df_leads[_df_leads.get("tipo_lead") == "zona_branca"] if not _df_leads.empty else _df_leads
+        _leads_ft = _df_leads[_df_leads.get("tipo_lead") == "fitness"] if not _df_leads.empty else _df_leads
+
+        # Centro e zoom do mapa base (carteira)
+        _lat_c = float(_mapa_agg["lat"].mean())
+        _lon_c = float(_mapa_agg["lon"].mean())
+        _lat_span = float(_mapa_agg["lat"].max() - _mapa_agg["lat"].min())
+        _lon_span = float(_mapa_agg["lon"].max() - _mapa_agg["lon"].min())
+        _span = max(_lat_span, _lon_span, 0.1)
+        _zoom_inicial = max(3.2, min(7.0, 8.5 - math.log2(_span + 1) * 1.6))
+
+        # ─────────────────────────────────────────────────────────────────
+        # MAPA A — Cobertura (clientes atuais)
+        # ─────────────────────────────────────────────────────────────────
+        st.subheader("Cobertura — clientes atuais")
+        _pm1, _pm2, _pm3 = st.columns(3)
+        _pm1.metric("Clientes mapeados", fmt_num(len(_mapa_base)))
+        _pm2.metric("Cidades atendidas", fmt_num(_mapa_agg["cidade"].nunique()))
+        _pm3.metric("Ticket médio", fmt_brl(_mapa_base["ticket_medio_r"].mean()))
+
+        _fig_cob = go.Figure()
+
+        # Raio médio (linha de contexto, sempre visível se calculável)
+        if _raio_medio and _raio_medio > 0:
+            _circle_lat, _circle_lon = circle_points_km(
+                SEDE_LAT, SEDE_LON, float(_raio_medio)
+            )
+            _fig_cob.add_trace(go.Scattermapbox(
+                lat=_circle_lat, lon=_circle_lon, mode="lines",
+                line=dict(color="rgba(11,79,159,0.55)", width=1.5),
+                hovertemplate=(
+                    f"Raio médio ponderado por LTV: "
+                    f"{fmt_num(_raio_medio, 0)} km<extra></extra>"
+                ),
+                name=f"Raio médio ({fmt_num(_raio_medio, 0)} km)",
+            ))
+
+        # Clientes atuais agregados por cidade (tamanho ∝ nº clientes)
+        if not _mapa_agg.empty:
+            _size_base = _mapa_agg["n_clientes"].astype(float).pow(0.5)
+            _size_max = max(_size_base.max(), 1e-9)
+            _size_atuais = 7 + (_size_base / _size_max) * 24  # 7–31 px
+            _fig_cob.add_trace(go.Scattermapbox(
+                lat=_mapa_agg["lat"], lon=_mapa_agg["lon"], mode="markers",
+                marker=dict(
+                    size=_size_atuais,
+                    color=CORES_COBERTURA["Atuais"],
+                    opacity=0.82,
+                ),
+                text=_mapa_agg.apply(
+                    lambda r: (
+                        f"<b>{r['cidade']}/{r['uf']}</b><br>"
+                        f"Clientes: {fmt_num(r['n_clientes'])}<br>"
+                        f"LTV: {fmt_brl(r['ltv'], compact=True)}<br>"
+                        f"Ticket médio: {fmt_brl(r['ticket_medio'])}<br>"
+                        f"Perfil dominante: {r['tipologia_pred']}"
+                    ),
+                    axis=1,
+                ),
+                hovertemplate="%{text}<extra></extra>",
+                name=f"Atuais ({fmt_num(_mapa_agg['cidade'].nunique())} cidades)",
+            ))
+
+        # Sede (sempre por último para ficar por cima)
+        _fig_cob.add_trace(go.Scattermapbox(
+            lat=[SEDE_LAT], lon=[SEDE_LON], mode="markers+text",
+            text=["Sede"], textposition="top right",
+            marker=dict(size=12, color="#111111"),
+            hovertemplate="Santa Cruz do Capibaribe/PE<extra></extra>",
+            name="Sede", showlegend=False,
+        ))
+
+        _fig_cob.update_layout(
+            height=560,
+            margin=dict(l=0, r=0, t=10, b=0),
+            paper_bgcolor="#fff",
+            mapbox=dict(
+                style="carto-positron",
+                center={"lat": _lat_c, "lon": _lon_c},
+                zoom=_zoom_inicial,
+            ),
+            legend=dict(orientation="h", y=-0.06),
+        )
+        apply_ptbr(_fig_cob)
+        st.plotly_chart(_fig_cob, use_container_width=True)
+        st.caption(
+            f"Segmento: **{_seg_label}** · "
+            "1 ponto por cidade, tamanho ∝ nº de clientes."
+        )
+
+        # ─────────────────────────────────────────────────────────────────
+        # MAPA B — Intensidade (heatmap com toggle LTV / Nº clientes) + correlações
+        # ─────────────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Intensidade")
+
+        _int_modo = st.radio(
+            "Métrica",
+            ["LTV", "Nº de clientes"],
+            horizontal=True,
+            key="_int_metric",
+        )
+        _int_col, _int_label = (
+            ("ltv", "LTV")
+            if _int_modo == "LTV"
+            else ("n_clientes", "Nº de clientes")
+        )
+
+        _int_raw = _mapa_agg[_int_col].fillna(0).astype(float).clip(lower=0)
+        _mapa_agg["_int_log"] = _int_raw.map(lambda v: math.log1p(v))
+        _log_max = max(_mapa_agg["_int_log"].max(), 1e-9)
+
+        _COLORSCALE = [
+            [0.00, "#2b83ba"],
+            [0.25, "#abdda4"],
+            [0.50, "#ffffbf"],
+            [0.75, "#fdae61"],
+            [1.00, "#d7191c"],
+        ]
+
+        _fig_int = go.Figure()
+        _fig_int.add_trace(go.Densitymapbox(
+            lat=_mapa_agg["lat"], lon=_mapa_agg["lon"], z=_mapa_agg["_int_log"],
+            radius=32, colorscale=_COLORSCALE,
+            zmin=0, zmax=_log_max, opacity=0.82,
+            showscale=True,
+            colorbar=dict(
+                title=f"{_int_label} (log)",
+                tickvals=[0, _log_max * 0.5, _log_max],
+                ticktext=["baixo", "médio", "alto"],
+            ),
+            hoverinfo="skip",
+            name=f"Densidade · {_int_label}",
+        ))
+        # Hover invisível por cidade
+        _fig_int.add_trace(go.Scattermapbox(
+            lat=_mapa_agg["lat"], lon=_mapa_agg["lon"], mode="markers",
+            marker=dict(size=14, color="rgba(0,0,0,0)"),
+            text=_mapa_agg.apply(
+                lambda r: (
+                    f"<b>{r['cidade']}/{r['uf']}</b><br>"
+                    f"LTV: {fmt_brl(r['ltv'], compact=True)}<br>"
+                    f"Clientes: {fmt_num(r['n_clientes'])}<br>"
+                    + (f"População: {fmt_num(int(r['populacao']))}<br>"
+                       if pd.notna(r.get('populacao')) else "")
+                    + (f"PIB/cap: {fmt_brl(r['pib_per_capita'])}"
+                       if pd.notna(r.get('pib_per_capita')) else "")
+                ),
+                axis=1,
+            ),
+            hovertemplate="%{text}<extra></extra>",
+            showlegend=False,
+        ))
+        _fig_int.add_trace(go.Scattermapbox(
+            lat=[SEDE_LAT], lon=[SEDE_LON], mode="markers+text",
+            text=["Sede"], textposition="top right",
+            marker=dict(size=11, color="#111111"),
+            hovertemplate="Santa Cruz do Capibaribe/PE<extra></extra>",
+            showlegend=False,
+        ))
+        _fig_int.update_layout(
+            height=520,
+            margin=dict(l=0, r=0, t=10, b=0),
+            paper_bgcolor="#fff",
+            mapbox=dict(
+                style="carto-positron",
+                center={"lat": _lat_c, "lon": _lon_c},
+                zoom=_zoom_inicial,
+            ),
+        )
+        apply_ptbr(_fig_int)
+        st.plotly_chart(_fig_int, use_container_width=True)
+        st.caption(
+            f"Calor ponderado por **{_int_label}** agregado por cidade "
+            "(escala logarítmica log1p)."
+        )
+
+        # ─────────────────────────────────────────────────────────────────
+        # MAPA C — Leads prospectados (zona branca / fitness / ambos)
+        # ─────────────────────────────────────────────────────────────────
+        if not _df_leads.empty:
+            st.divider()
+            st.subheader("Leads prospectados (Google Places)")
+
+            _pc1, _pc2 = st.columns([1.3, 2])
+            with _pc1:
+                _leads_escopo = st.radio(
+                    "Escopo",
+                    ["Zona branca", "Fitness", "Ambos"],
+                    horizontal=True,
+                    key="_leads_escopo",
                 )
-            )
-            _tip_pred = (
-                _mapa_filtrado.groupby(["cidade", "uf"])["tipologia"]
-                .agg(lambda x: x.value_counts().index[0] if len(x) else "Sem classificação")
-                .reset_index()
-                .rename(columns={"tipologia": "tipologia_pred"})
-            )
-            _mapa_agg = _mapa_agg.merge(_tip_pred, on=["cidade", "uf"], how="left")
+            with _pc2:
+                _pcmetr1, _pcmetr2 = st.columns(2)
+                _pcmetr1.metric(
+                    "Leads zona branca",
+                    fmt_num(len(_leads_zb)),
+                    help="Lojas de moda praia/biquíni em cidades sem cliente.",
+                )
+                _pcmetr2.metric(
+                    "Leads fitness",
+                    fmt_num(len(_leads_ft)),
+                    help="Lojas de moda/roupa fitness.",
+                )
 
-            # ── métricas de penetração ─────────────────────────────────────
-            _pm1, _pm2, _pm3 = st.columns(3)
-            _pm1.metric("Clientes mapeados", fmt_num(len(_mapa_filtrado)))
-            _pm2.metric("Cidades alcançadas", fmt_num(_mapa_agg["cidade"].nunique()))
-            _pm3.metric("Ticket médio", fmt_brl(_mapa_filtrado["ticket_medio_r"].mean()))
+            _fig_leads = go.Figure()
 
-            # ── heatmap agregado por cidade ────────────────────────────────
-            _z_map = {
-                "Clientes":     ("n_clientes",   "Clientes"),
-                "LTV":          ("ltv",          "LTV (R$)"),
-                "Ticket médio": ("ticket_medio", "Ticket médio (R$)"),
-            }
-            _z_col, _z_title = _z_map[_mapa_modo]
-
-            _raio_medio = (
-                (_mapa_filtrado["distancia_km"] * _mapa_filtrado["valor_total_r"]).sum()
-                / _mapa_filtrado["valor_total_r"].sum()
-            ) if _mapa_filtrado["distancia_km"].notna().any() and _mapa_filtrado["valor_total_r"].sum() > 0 else None
-
-            # Transformação log: comprime a escala para que cidades com poucos
-            # clientes não caiam em ~0 numa escala dominada por Santa Cruz.
-            _raw = _mapa_agg[_z_col].fillna(0).astype(float).clip(lower=0)
-            _mapa_agg["_z_log"] = _raw.map(lambda v: math.log1p(v))
-            _log_max = max(_mapa_agg["_z_log"].max(), 1e-9)
-
-            _COLORSCALE = [
-                [0.00, "#2b83ba"],
-                [0.25, "#abdda4"],
-                [0.50, "#ffffbf"],
-                [0.75, "#fdae61"],
-                [1.00, "#d7191c"],
-            ]
-
-            # Centro e zoom ajustados ao segmento exibido (em vez do BR inteiro,
-            # que escondia dispersão fora de PE). Mantém dentro de faixa razoável.
-            _lat_c = float(_mapa_agg["lat"].mean())
-            _lon_c = float(_mapa_agg["lon"].mean())
-            _lat_span = float(_mapa_agg["lat"].max() - _mapa_agg["lat"].min())
-            _lon_span = float(_mapa_agg["lon"].max() - _mapa_agg["lon"].min())
-            _span = max(_lat_span, _lon_span, 0.1)
-            _zoom_inicial = max(3.2, min(7.0, 8.5 - math.log2(_span + 1) * 1.6))
-
-            _fig_mapa = go.Figure()
-
-            # ── CAMADA 1: calor (opcional) ─────────────────────────────────
-            if _viz_modo in ("Ambos", "Calor"):
-                _fig_mapa.add_trace(go.Densitymapbox(
-                    lat=_mapa_agg["lat"],
-                    lon=_mapa_agg["lon"],
-                    z=_mapa_agg["_z_log"],
-                    radius=28,
-                    colorscale=_COLORSCALE,
-                    zmin=0,
-                    zmax=_log_max,
-                    opacity=0.55 if _viz_modo == "Ambos" else 0.85,
-                    showscale=(_viz_modo == "Calor"),
-                    colorbar=dict(
-                        title=f"{_z_title} (log)",
-                        tickvals=[0, _log_max * 0.5, _log_max],
-                        ticktext=["baixo", "médio", "alto"],
-                    ),
-                    hoverinfo="skip",
-                    name="Densidade",
-                ))
-
-            # ── CAMADA 2: pontos por cidade (sempre visível, resistente a zoom)
-            if _viz_modo in ("Ambos", "Pontos"):
-                _size_base = _raw.pow(0.5)  # sqrt comprime sem zerar pequenos
-                _size_max = max(_size_base.max(), 1e-9)
-                _marker_size = 6 + (_size_base / _size_max) * 26  # 6–32 px
-
-                _fig_mapa.add_trace(go.Scattermapbox(
-                    lat=_mapa_agg["lat"],
-                    lon=_mapa_agg["lon"],
-                    mode="markers",
+            # Fundo discreto — cidades com cliente (cinza claro, só contexto)
+            if not _mapa_agg.empty:
+                _fig_leads.add_trace(go.Scattermapbox(
+                    lat=_mapa_agg["lat"], lon=_mapa_agg["lon"], mode="markers",
                     marker=dict(
-                        size=_marker_size,
-                        color=_mapa_agg["_z_log"],
-                        colorscale=_COLORSCALE,
-                        cmin=0,
-                        cmax=_log_max,
-                        opacity=0.78,
-                        showscale=(_viz_modo == "Pontos"),
-                        colorbar=dict(
-                            title=f"{_z_title} (log)",
-                            tickvals=[0, _log_max * 0.5, _log_max],
-                            ticktext=["baixo", "médio", "alto"],
-                        ) if _viz_modo == "Pontos" else None,
+                        size=6,
+                        color="rgba(156, 163, 175, 0.55)",  # cinza neutro
+                        opacity=1.0,
                     ),
-                    text=_mapa_agg.apply(
-                        lambda r: (
-                            f"<b>{r['cidade']}/{r['uf']}</b><br>"
-                            f"Clientes: {fmt_num(r['n_clientes'])}<br>"
-                            f"LTV: {fmt_brl(r['ltv'], compact=True)}<br>"
-                            f"Ticket médio: {fmt_brl(r['ticket_medio'])}<br>"
-                            f"Perfil dominante: {r['tipologia_pred']}"
-                        ),
-                        axis=1,
-                    ),
-                    hovertemplate="%{text}<extra></extra>",
-                    name="Cidades atendidas",
-                    showlegend=False,
-                ))
-            else:
-                # Hover invisível quando modo = Calor
-                _fig_mapa.add_trace(go.Scattermapbox(
-                    lat=_mapa_agg["lat"],
-                    lon=_mapa_agg["lon"],
-                    mode="markers",
-                    marker=dict(size=16, color="rgba(0,0,0,0)"),
                     text=_mapa_agg.apply(
                         lambda r: (
                             f"<b>{r['cidade']}/{r['uf']}</b><br>"
@@ -2942,96 +3049,74 @@ elif painel == "Demografia":
                         axis=1,
                     ),
                     hovertemplate="%{text}<extra></extra>",
-                    showlegend=False,
+                    name=f"Cidades com cliente ({fmt_num(_mapa_agg['cidade'].nunique())})",
                 ))
 
-            # ── CAMADA 3: zonas brancas dentro do raio ─────────────────────
-            _mostra_brancas = st.session_state.get("_mostra_zonas_brancas", True)
-            _pop_min = st.session_state.get("_pop_min_brancas", 10000)
-            _df_brancas = pd.DataFrame()
-            if _raio_medio and _raio_medio > 0:
-                try:
-                    _df_brancas = zonas_brancas_no_raio(
-                        _mapa_agg[["cidade", "uf"]],
-                        raio_km=float(_raio_medio),
-                        pop_min=int(_pop_min),
-                    )
-                except Exception:
-                    _df_brancas = pd.DataFrame()
-
-            _tem_pop = (
-                not _df_brancas.empty
-                and _df_brancas["populacao"].notna().any()
-            )
-            if _mostra_brancas and not _df_brancas.empty:
-                if _tem_pop:
-                    _bsize_base = _df_brancas["populacao"].fillna(0).astype(float).pow(0.5)
-                else:
-                    # Sem população: tamanho fixo por distância inversa
-                    _bsize_base = pd.Series([1.0] * len(_df_brancas))
-                _bsize_max = max(_bsize_base.max(), 1e-9)
-                _bmarker_size = 6 + (_bsize_base / _bsize_max) * 20  # 6–26 px
-
-                def _hover_branca(r):
-                    linhas = [f"<b>{r['cidade']}/{r['uf']}</b>"]
-                    if pd.notna(r.get("populacao")):
-                        linhas.append(f"População: {fmt_num(int(r['populacao']))}")
-                    linhas.append(f"Distância sede: {fmt_num(r['distancia_km'], 0)} km")
-                    linhas.append("<i>Oportunidade · cidade sem cliente</i>")
-                    return "<br>".join(linhas)
-
-                # Halo externo — anel translúcido que sugere "espaço vazio"
-                _fig_mapa.add_trace(go.Scattermapbox(
-                    lat=_df_brancas["lat"],
-                    lon=_df_brancas["lon"],
-                    mode="markers",
-                    marker=dict(
-                        size=_bmarker_size * 1.6,
-                        color="rgba(107, 114, 128, 0.18)",  # cinza neutro
-                        opacity=1.0,
-                    ),
+            # Leads zona branca (branco com contorno escuro)
+            if _leads_escopo in ("Zona branca", "Ambos") and not _leads_zb.empty:
+                _fig_leads.add_trace(go.Scattermapbox(
+                    lat=_leads_zb["lat"], lon=_leads_zb["lon"], mode="markers",
+                    marker=dict(size=13, color="rgba(31, 41, 55, 0.9)"),
                     hoverinfo="skip",
                     showlegend=False,
                 ))
-                # Miolo — marker âmbar (oportunidade, não alarme)
-                _fig_mapa.add_trace(go.Scattermapbox(
-                    lat=_df_brancas["lat"],
-                    lon=_df_brancas["lon"],
-                    mode="markers",
+                _fig_leads.add_trace(go.Scattermapbox(
+                    lat=_leads_zb["lat"], lon=_leads_zb["lon"], mode="markers",
                     marker=dict(
-                        size=_bmarker_size * 0.55,
-                        color="rgba(245, 158, 11, 0.85)",  # âmbar = oportunidade
-                        opacity=0.95,
+                        size=10,
+                        color=CORES_COBERTURA["Zona branca"],
+                        opacity=1.0,
                     ),
-                    text=_df_brancas.apply(_hover_branca, axis=1),
+                    text=_leads_zb.apply(
+                        lambda r: (
+                            f"<b>{r['nome']}</b><br>"
+                            f"{r['cidade']}/{r['uf']}<br>"
+                            f"Termo: {r.get('termo_busca','—')}<br>"
+                            + (f"Rating: {r['rating']} ({fmt_num(int(r['qtd_reviews']))} reviews)<br>"
+                               if pd.notna(r.get('rating')) else "")
+                            + "<i>Lead zona branca</i>"
+                        ),
+                        axis=1,
+                    ),
                     hovertemplate="%{text}<extra></extra>",
-                    name="Oportunidade (sem cliente)",
-                    showlegend=True,
+                    name=f"Zona branca ({fmt_num(len(_leads_zb))} lojas)",
                 ))
 
-            if _raio_medio and _raio_medio > 0:
-                _circle_lat, _circle_lon = circle_points_km(SEDE_LAT, SEDE_LON, float(_raio_medio))
-                _fig_mapa.add_trace(go.Scattermapbox(
-                    lat=_circle_lat,
-                    lon=_circle_lon,
-                    mode="lines",
-                    line=dict(color="rgba(11,79,159,0.70)", width=2),
-                    hovertemplate=f"Raio médio ponderado por LTV: {fmt_num(_raio_medio, 0)} km<extra></extra>",
-                    name="Raio médio",
+            # Leads fitness (verde vibrante)
+            if _leads_escopo in ("Fitness", "Ambos") and not _leads_ft.empty:
+                _fig_leads.add_trace(go.Scattermapbox(
+                    lat=_leads_ft["lat"], lon=_leads_ft["lon"], mode="markers",
+                    marker=dict(
+                        size=10,
+                        color=CORES_COBERTURA["Fitness"],
+                        opacity=0.92,
+                    ),
+                    text=_leads_ft.apply(
+                        lambda r: (
+                            f"<b>{r['nome']}</b><br>"
+                            f"{r['cidade']}/{r['uf']}<br>"
+                            f"Termo: {r.get('termo_busca','—')}<br>"
+                            + (f"Rating: {r['rating']} ({fmt_num(int(r['qtd_reviews']))} reviews)<br>"
+                               if pd.notna(r.get('rating')) else "")
+                            + "<i>Lead fitness</i>"
+                        ),
+                        axis=1,
+                    ),
+                    hovertemplate="%{text}<extra></extra>",
+                    name=f"Fitness ({fmt_num(len(_leads_ft))} lojas)",
                 ))
 
-            _fig_mapa.add_trace(go.Scattermapbox(
-                lat=[SEDE_LAT],
-                lon=[SEDE_LON],
-                mode="markers+text",
-                text=["Sede"],
-                textposition="top right",
+            # Sede
+            _fig_leads.add_trace(go.Scattermapbox(
+                lat=[SEDE_LAT], lon=[SEDE_LON], mode="markers+text",
+                text=["Sede"], textposition="top right",
                 marker=dict(size=11, color="#111111"),
                 hovertemplate="Santa Cruz do Capibaribe/PE<extra></extra>",
-                name="Sede",
+                name="Sede", showlegend=False,
             ))
-            _fig_mapa.update_layout(
-                height=580,
+
+            _fig_leads.update_layout(
+                height=560,
                 margin=dict(l=0, r=0, t=10, b=0),
                 paper_bgcolor="#fff",
                 mapbox=dict(
@@ -3039,105 +3124,258 @@ elif painel == "Demografia":
                     center={"lat": _lat_c, "lon": _lon_c},
                     zoom=_zoom_inicial,
                 ),
-                legend=dict(orientation="h", y=-0.08),
+                legend=dict(orientation="h", y=-0.06),
             )
-            apply_ptbr(_fig_mapa)
-            st.plotly_chart(_fig_mapa, use_container_width=True)
+            apply_ptbr(_fig_leads)
+            st.plotly_chart(_fig_leads, use_container_width=True)
             st.caption(
-                (
-                    f"Raio médio (ponderado por LTV) = {fmt_num(_raio_medio, 0)} km · "
-                    if _raio_medio else "Raio médio indisponível · "
+                "1 pin por loja prospectada. Cinza = cidades onde já temos cliente (fundo de contexto)."
+            )
+
+            # Tabela de leads do escopo atual — ranking por reviews
+            _leads_tabela = _df_leads.copy()
+            if _leads_escopo == "Zona branca":
+                _leads_tabela = _leads_tabela[_leads_tabela["tipo_lead"] == "zona_branca"]
+            elif _leads_escopo == "Fitness":
+                _leads_tabela = _leads_tabela[_leads_tabela["tipo_lead"] == "fitness"]
+            _leads_tabela = _leads_tabela.sort_values(
+                ["qtd_reviews", "rating"], ascending=[False, False],
+                na_position="last",
+            ).head(30).copy()
+            if not _leads_tabela.empty:
+                _leads_tabela["Reviews"] = _leads_tabela["qtd_reviews"].apply(
+                    lambda v: fmt_num(int(v)) if pd.notna(v) else "—"
                 )
-                + f"Visualização: **{_viz_modo}** · Segmento: **{_seg_label}** · "
-                + "Escala logarítmica (log1p) — evita que cidades de baixa densidade sumam."
-            )
-
-            # ── controles de oportunidades + tabelas ───────────────────────
-            _tab_top, _tab_brancas = st.tabs(
-                ["Top cidades atendidas", "Oportunidades no raio"]
-            )
-
-            with _tab_top:
-                _cidades_top = _mapa_agg.sort_values("ltv", ascending=False).head(15).copy()
-                _cidades_top["Clientes"] = _cidades_top["n_clientes"].apply(fmt_num)
-                _cidades_top["LTV"] = _cidades_top["ltv"].apply(lambda v: fmt_brl(v, compact=True))
-                _cidades_top["Ticket médio"] = _cidades_top["ticket_medio"].apply(fmt_brl)
+                _leads_tabela["Rating"] = _leads_tabela["rating"].apply(
+                    lambda v: f"{v:.1f}" if pd.notna(v) else "—"
+                )
+                _leads_tabela["Tipo"] = _leads_tabela["tipo_lead"].map(
+                    {"zona_branca": "Zona branca", "fitness": "Fitness"}
+                )
                 st.dataframe(
-                    _cidades_top.rename(columns={
-                        "cidade": "Cidade", "uf": "UF", "tipologia_pred": "Perfil dominante"
-                    })[["Cidade", "UF", "Clientes", "LTV", "Ticket médio", "Perfil dominante"]],
+                    _leads_tabela.rename(columns={
+                        "nome": "Loja", "cidade": "Cidade", "uf": "UF",
+                        "termo_busca": "Termo",
+                    })[["Loja", "Cidade", "UF", "Tipo", "Termo",
+                        "Rating", "Reviews"]],
                     use_container_width=True,
                     hide_index=True,
                 )
 
-            with _tab_brancas:
-                _col_zb1, _col_zb2 = st.columns([1, 1])
-                with _col_zb1:
-                    st.checkbox(
-                        "Destacar oportunidades no mapa",
-                        value=True,
-                        key="_mostra_zonas_brancas",
-                    )
-                with _col_zb2:
-                    st.select_slider(
-                        "População mínima",
-                        options=[5000, 10000, 20000, 50000, 100000],
-                        value=10000,
-                        key="_pop_min_brancas",
-                        help=(
-                            "Filtra cidades pequenas. Elevar o mínimo foca em "
-                            "oportunidades com massa de mercado."
-                        ),
-                    )
+        # ── Correlações: LTV × população e LTV × PIB per capita ──────────
+        st.markdown("**LTV da cidade × tamanho de mercado**")
+        _corr_base = _mapa_agg[["cidade", "uf", "ltv", "n_clientes",
+                                "populacao", "pib_per_capita"]].copy()
+        _corr_base["populacao"] = pd.to_numeric(_corr_base["populacao"], errors="coerce")
+        _corr_base["pib_per_capita"] = pd.to_numeric(
+            _corr_base["pib_per_capita"], errors="coerce"
+        )
 
-                if _df_brancas.empty:
-                    if not _raio_medio or _raio_medio <= 0:
-                        st.info(
-                            "Sem raio médio calculável para o segmento selecionado "
-                            "(faltam vendas com distância/LTV)."
-                        )
-                    else:
-                        st.success(
-                            f"Dentro do raio de {fmt_num(_raio_medio, 0)} km não há "
-                            f"cidades acima de {fmt_num(_pop_min)} habitantes sem cliente. "
-                            "Reduza o filtro de população ou expanda o raio."
-                        )
+        def _corr_spearman(s_x: pd.Series, s_y: pd.Series) -> float | None:
+            df_c = pd.concat([s_x, s_y], axis=1).dropna()
+            if len(df_c) < 5:
+                return None
+            try:
+                return float(df_c.iloc[:, 0].corr(df_c.iloc[:, 1], method="spearman"))
+            except Exception:
+                return None
+
+        _rho_pop = _corr_spearman(_corr_base["populacao"], _corr_base["ltv"])
+        _rho_pib = _corr_spearman(_corr_base["pib_per_capita"], _corr_base["ltv"])
+
+        _c_pop, _c_pib = st.columns(2)
+
+        def _fmt_rho(v):
+            if v is None:
+                return "—"
+            forca = ("forte" if abs(v) >= 0.6 else "moderada" if abs(v) >= 0.3 else "fraca")
+            return f"ρ = {v:+.2f} ({forca})"
+
+        with _c_pop:
+            _df_pop = _corr_base.dropna(subset=["populacao", "ltv"]).copy()
+            if not _df_pop.empty:
+                _fig_pop = px.scatter(
+                    _df_pop, x="populacao", y="ltv",
+                    size="n_clientes", size_max=28,
+                    hover_name="cidade",
+                    hover_data={"uf": True, "populacao": ":,", "ltv": ":,.0f",
+                                "n_clientes": True},
+                    labels={"populacao": "População (hab.)",
+                            "ltv": "LTV total (R$)",
+                            "n_clientes": "Clientes"},
+                )
+                _fig_pop.update_traces(
+                    marker=dict(color=CORES_COBERTURA["Atuais"], opacity=0.72,
+                                line=dict(color="#ffffff", width=1)),
+                )
+                _fig_pop.update_layout(
+                    height=340, margin=dict(l=0, r=0, t=30, b=0),
+                    plot_bgcolor="#fff", paper_bgcolor="#fff",
+                    title=dict(text=f"LTV × População · Spearman {_fmt_rho(_rho_pop)}",
+                               x=0, font=dict(size=13)),
+                )
+                _fig_pop.update_xaxes(type="log", gridcolor="#f0f0f0",
+                                      title_text="População (log)")
+                _fig_pop.update_yaxes(type="log", gridcolor="#f0f0f0",
+                                      title_text="LTV (log)", tickprefix="R$ ")
+                apply_ptbr(_fig_pop)
+                st.plotly_chart(_fig_pop, use_container_width=True)
+            else:
+                st.info("População IBGE indisponível para as cidades atendidas.")
+
+        with _c_pib:
+            _df_pib = _corr_base.dropna(subset=["pib_per_capita", "ltv"]).copy()
+            if not _df_pib.empty:
+                _fig_pib = px.scatter(
+                    _df_pib, x="pib_per_capita", y="ltv",
+                    size="n_clientes", size_max=28,
+                    hover_name="cidade",
+                    hover_data={"uf": True, "pib_per_capita": ":,.0f",
+                                "ltv": ":,.0f", "n_clientes": True},
+                    labels={"pib_per_capita": "PIB per capita (R$)",
+                            "ltv": "LTV total (R$)",
+                            "n_clientes": "Clientes"},
+                )
+                _fig_pib.update_traces(
+                    marker=dict(color="#7C3AED", opacity=0.72,
+                                line=dict(color="#ffffff", width=1)),
+                )
+                _fig_pib.update_layout(
+                    height=340, margin=dict(l=0, r=0, t=30, b=0),
+                    plot_bgcolor="#fff", paper_bgcolor="#fff",
+                    title=dict(text=f"LTV × PIB per capita · Spearman {_fmt_rho(_rho_pib)}",
+                               x=0, font=dict(size=13)),
+                )
+                _fig_pib.update_xaxes(type="log", gridcolor="#f0f0f0",
+                                      title_text="PIB/cap (log)", tickprefix="R$ ")
+                _fig_pib.update_yaxes(type="log", gridcolor="#f0f0f0",
+                                      title_text="LTV (log)", tickprefix="R$ ")
+                apply_ptbr(_fig_pib)
+                st.plotly_chart(_fig_pib, use_container_width=True)
+            else:
+                st.info("PIB per capita IBGE indisponível no cache.")
+
+        # Insight automático
+        if _rho_pop is not None or _rho_pib is not None:
+            if _rho_pop is not None and _rho_pib is not None:
+                if abs(_rho_pop) - abs(_rho_pib) > 0.1:
+                    _insight = (
+                        f"📊 O LTV por cidade está **mais ligado à população** "
+                        f"(ρ={_rho_pop:+.2f}) do que à renda per capita "
+                        f"(ρ={_rho_pib:+.2f}) — volume de mercado pesa mais que poder aquisitivo médio."
+                    )
+                elif abs(_rho_pib) - abs(_rho_pop) > 0.1:
+                    _insight = (
+                        f"📊 O LTV por cidade está **mais ligado ao PIB per capita** "
+                        f"(ρ={_rho_pib:+.2f}) do que à população (ρ={_rho_pop:+.2f}) — "
+                        "concentração de renda empurra mais vendas do que tamanho bruto."
+                    )
                 else:
-                    _mp1, _mp2, _mp3 = st.columns(3)
-                    _mp1.metric("Cidades sem cliente (no raio)", fmt_num(len(_df_brancas)))
-                    if _tem_pop:
-                        _pop_sem_penet = int(_df_brancas["populacao"].fillna(0).sum())
-                        _mp2.metric("População não atendida", fmt_num(_pop_sem_penet))
-                    else:
-                        _mp2.metric("População não atendida", "—",
-                                    help="Dados de população IBGE indisponíveis no cache.")
-                    _mp3.metric(
-                        "Raio analisado",
-                        f"{fmt_num(_raio_medio, 0)} km",
-                        help="Raio médio ponderado por LTV do segmento selecionado.",
+                    _insight = (
+                        f"📊 Ambos correlacionam em magnitude parecida (pop ρ={_rho_pop:+.2f}, "
+                        f"PIB/cap ρ={_rho_pib:+.2f}). Crescer depende das duas coisas juntas."
                     )
+            else:
+                _r = _rho_pop if _rho_pop is not None else _rho_pib
+                _var = "população" if _rho_pop is not None else "PIB per capita"
+                _insight = f"📊 LTV × {_var}: ρ={_r:+.2f}."
+            st.caption(_insight)
 
-                    _brancas_show = _df_brancas.head(25).copy()
-                    _brancas_show["População"] = _brancas_show["populacao"].apply(
-                        lambda v: fmt_num(int(v)) if pd.notna(v) else "—"
+        # ── controles de oportunidades + tabelas (mantido) ───────────────
+        st.divider()
+        _pop_min = st.session_state.get("_pop_min_brancas", 10000)
+        _df_brancas = pd.DataFrame()
+        if _raio_medio and _raio_medio > 0:
+            try:
+                _df_brancas = zonas_brancas_no_raio(
+                    _mapa_agg[["cidade", "uf"]],
+                    raio_km=float(_raio_medio),
+                    pop_min=int(_pop_min),
+                )
+            except Exception:
+                _df_brancas = pd.DataFrame()
+        _tem_pop = (
+            not _df_brancas.empty
+            and _df_brancas["populacao"].notna().any()
+        )
+
+        _tab_top, _tab_brancas = st.tabs(
+            ["Top cidades atendidas", "Cidades sem cliente (IBGE)"]
+        )
+
+        with _tab_top:
+            _cidades_top = _mapa_agg.sort_values("ltv", ascending=False).head(15).copy()
+            _cidades_top["Clientes"] = _cidades_top["n_clientes"].apply(fmt_num)
+            _cidades_top["LTV"] = _cidades_top["ltv"].apply(lambda v: fmt_brl(v, compact=True))
+            _cidades_top["Ticket médio"] = _cidades_top["ticket_medio"].apply(fmt_brl)
+            st.dataframe(
+                _cidades_top.rename(columns={
+                    "cidade": "Cidade", "uf": "UF", "tipologia_pred": "Perfil dominante"
+                })[["Cidade", "UF", "Clientes", "LTV", "Ticket médio", "Perfil dominante"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with _tab_brancas:
+            st.select_slider(
+                "População mínima",
+                options=[5000, 10000, 20000, 50000, 100000],
+                value=10000,
+                key="_pop_min_brancas",
+                help=(
+                    "Filtra cidades pequenas. Elevar o mínimo foca em "
+                    "oportunidades com massa de mercado."
+                ),
+            )
+
+            if _df_brancas.empty:
+                if not _raio_medio or _raio_medio <= 0:
+                    st.info(
+                        "Sem raio médio calculável para o segmento selecionado "
+                        "(faltam vendas com distância/LTV)."
                     )
-                    _brancas_show["Distância"] = _brancas_show["distancia_km"].apply(
-                        lambda v: f"{fmt_num(v, 0)} km"
+                else:
+                    st.success(
+                        f"Dentro do raio de {fmt_num(_raio_medio, 0)} km não há "
+                        f"cidades acima de {fmt_num(_pop_min)} habitantes sem cliente. "
+                        "Reduza o filtro de população ou expanda o raio."
                     )
-                    st.dataframe(
-                        _brancas_show.rename(columns={
-                            "cidade": "Cidade", "uf": "UF",
-                        })[["Cidade", "UF", "População", "Distância"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    st.caption(
-                        "Cidades do IBGE dentro do raio médio de penetração **sem "
-                        "nenhum cliente na carteira** — "
-                        + ("ordenadas por população (potencial de mercado não atendido)."
-                           if _tem_pop
-                           else "ordenadas por distância da sede.")
-                    )
+            else:
+                _mp1, _mp2, _mp3 = st.columns(3)
+                _mp1.metric("Cidades sem cliente (no raio)", fmt_num(len(_df_brancas)))
+                if _tem_pop:
+                    _pop_sem_penet = int(_df_brancas["populacao"].fillna(0).sum())
+                    _mp2.metric("População não atendida", fmt_num(_pop_sem_penet))
+                else:
+                    _mp2.metric("População não atendida", "—",
+                                help="Dados de população IBGE indisponíveis no cache.")
+                _mp3.metric(
+                    "Raio analisado",
+                    f"{fmt_num(_raio_medio, 0)} km",
+                    help="Raio médio ponderado por LTV do segmento selecionado.",
+                )
+
+                _brancas_show = _df_brancas.head(25).copy()
+                _brancas_show["População"] = _brancas_show["populacao"].apply(
+                    lambda v: fmt_num(int(v)) if pd.notna(v) else "—"
+                )
+                _brancas_show["Distância"] = _brancas_show["distancia_km"].apply(
+                    lambda v: f"{fmt_num(v, 0)} km"
+                )
+                st.dataframe(
+                    _brancas_show.rename(columns={
+                        "cidade": "Cidade", "uf": "UF",
+                    })[["Cidade", "UF", "População", "Distância"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Cidades do IBGE dentro do raio médio de penetração **sem "
+                    "nenhum cliente na carteira** — "
+                    + ("ordenadas por população (potencial de mercado não atendido)."
+                       if _tem_pop
+                       else "ordenadas por distância da sede.")
+                )
 
     st.divider()
     st.subheader("Distribuição por distância")

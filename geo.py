@@ -64,6 +64,15 @@ CORES_TIPOLOGIA = {
     "Sem classificação": "#E0E0E0",
 }
 
+# Cores do Mapa A (Cobertura) — 3 camadas do Felipe:
+# Atuais (azul), zona branca (branco com contorno), fitness (verde vibrante)
+CORES_COBERTURA = {
+    "Atuais":      "#1A73E8",
+    "Zona branca": "#FFFFFF",
+    "Fitness":     "#22C55E",
+}
+TERMOS_FITNESS = {"moda fitness", "roupa fitness"}
+
 CORES_FAIXA = {
     "Até 50 km · Entorno":                "#0D47A1",
     "50–150 km · Bate-volta":             "#1565C0",
@@ -347,3 +356,39 @@ def zonas_brancas_no_raio(
 
     cols = ["cidade", "uf", "lat", "lon", "populacao", "distancia_km"]
     return brancas[[c for c in cols if c in brancas.columns]].reset_index(drop=True)
+
+
+# ─── Leads prospectados via Google Places ────────────────────────────────────
+_LEADS_PROSPECTS_PATH = (
+    Path(__file__).parent.parent / "output" / "zonas_brancas" / "lojas_prospects.csv"
+)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def carregar_leads_prospects() -> pd.DataFrame:
+    """Lê `output/zonas_brancas/lojas_prospects.csv` e deriva `tipo_lead`.
+
+    Retorna DF com lojas físicas (1 linha por estabelecimento), com colunas:
+    cidade, uf, lat, lon, populacao, distancia_scc_km, termo_busca, tipo_lead,
+    nome, rating, qtd_reviews, telefone, website, instagram, url_maps.
+
+    `tipo_lead` ∈ {"fitness", "zona_branca"} conforme `termo_busca`.
+    Linhas sem lat/lon são descartadas (não podem ir ao mapa).
+    """
+    if not _LEADS_PROSPECTS_PATH.exists():
+        return pd.DataFrame(columns=[
+            "cidade", "uf", "lat", "lon", "termo_busca", "tipo_lead", "nome",
+        ])
+    df = pd.read_csv(_LEADS_PROSPECTS_PATH, sep=";", encoding="utf-8-sig")
+    # Normaliza tipos
+    for col in ("lat", "lon", "populacao", "distancia_scc_km", "rating", "qtd_reviews"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Descarta sem geolocalização
+    df = df.dropna(subset=["lat", "lon"]).copy()
+    # Classifica tipo_lead a partir do termo_busca
+    termo = df["termo_busca"].astype(str).str.strip().str.lower()
+    df["tipo_lead"] = termo.where(
+        termo.isin(TERMOS_FITNESS), other="zona_branca"
+    ).map(lambda t: "fitness" if t in TERMOS_FITNESS else "zona_branca")
+    return df.reset_index(drop=True)
