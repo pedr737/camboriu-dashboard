@@ -64,14 +64,12 @@ CORES_TIPOLOGIA = {
     "Sem classificação": "#E0E0E0",
 }
 
-# Cores do Mapa A (Cobertura) — 3 camadas do Felipe:
-# Atuais (azul), zona branca (branco com contorno), fitness (verde vibrante)
+# Cores do Mapa A (Cobertura) — camadas de visualização geográfica
+# Atuais (azul), zona branca (branco com contorno)
 CORES_COBERTURA = {
     "Atuais":      "#1A73E8",
     "Zona branca": "#FFFFFF",
-    "Fitness":     "#22C55E",
 }
-TERMOS_FITNESS = {"moda fitness", "roupa fitness"}
 
 CORES_FAIXA = {
     "Até 50 km · Entorno":                "#0D47A1",
@@ -364,31 +362,33 @@ _LEADS_PROSPECTS_PATH = (
 )
 
 
+_TERMOS_FITNESS_EXCLUIR = {"moda fitness", "roupa fitness"}
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def carregar_leads_prospects() -> pd.DataFrame:
-    """Lê `output/zonas_brancas/lojas_prospects.csv` e deriva `tipo_lead`.
+    """Lê `output/zonas_brancas/lojas_prospects.csv` e retorna apenas leads
+    de zona branca (moda praia/biquíni em cidades sem cliente).
 
     Retorna DF com lojas físicas (1 linha por estabelecimento), com colunas:
-    cidade, uf, lat, lon, populacao, distancia_scc_km, termo_busca, tipo_lead,
+    cidade, uf, lat, lon, populacao, distancia_scc_km, termo_busca,
     nome, rating, qtd_reviews, telefone, website, instagram, url_maps.
 
-    `tipo_lead` ∈ {"fitness", "zona_branca"} conforme `termo_busca`.
+    Leads com `termo_busca` associado a fitness são filtrados fora — o
+    CSV pode conter esses registros de buscas legadas, mas o dashboard
+    foca apenas em prospects alinhados ao produto (moda praia).
     Linhas sem lat/lon são descartadas (não podem ir ao mapa).
     """
     if not _LEADS_PROSPECTS_PATH.exists():
         return pd.DataFrame(columns=[
-            "cidade", "uf", "lat", "lon", "termo_busca", "tipo_lead", "nome",
+            "cidade", "uf", "lat", "lon", "termo_busca", "nome",
         ])
     df = pd.read_csv(_LEADS_PROSPECTS_PATH, sep=";", encoding="utf-8-sig")
-    # Normaliza tipos
     for col in ("lat", "lon", "populacao", "distancia_scc_km", "rating", "qtd_reviews"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Descarta sem geolocalização
     df = df.dropna(subset=["lat", "lon"]).copy()
-    # Classifica tipo_lead a partir do termo_busca
+    # Filtra fora termos de fitness — manter só zona branca / moda praia
     termo = df["termo_busca"].astype(str).str.strip().str.lower()
-    df["tipo_lead"] = termo.where(
-        termo.isin(TERMOS_FITNESS), other="zona_branca"
-    ).map(lambda t: "fitness" if t in TERMOS_FITNESS else "zona_branca")
+    df = df[~termo.isin(_TERMOS_FITNESS_EXCLUIR)].copy()
     return df.reset_index(drop=True)

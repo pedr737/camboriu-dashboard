@@ -2830,8 +2830,10 @@ elif painel == "Demografia":
             _df_leads = carregar_leads_prospects()
         except Exception:
             _df_leads = pd.DataFrame()
-        _leads_zb = _df_leads[_df_leads.get("tipo_lead") == "zona_branca"] if not _df_leads.empty else _df_leads
-        _leads_ft = _df_leads[_df_leads.get("tipo_lead") == "fitness"] if not _df_leads.empty else _df_leads
+        # carregar_leads_prospects já filtra fora termos fitness — retorna
+        # apenas prospects de moda praia (zona branca). Mantido como alias
+        # por clareza nos blocos abaixo.
+        _leads_zb = _df_leads
 
         # Centro e zoom do mapa base (carteira)
         _lat_c = float(_mapa_agg["lat"].mean())
@@ -2845,10 +2847,9 @@ elif painel == "Demografia":
         # MAPA A — Cobertura (clientes atuais)
         # ─────────────────────────────────────────────────────────────────
         st.subheader("Cobertura — clientes atuais")
-        _pm1, _pm2, _pm3 = st.columns(3)
+        _pm1, _pm2 = st.columns(2)
         _pm1.metric("Clientes mapeados", fmt_num(len(_mapa_base)))
         _pm2.metric("Cidades atendidas", fmt_num(_mapa_agg["cidade"].nunique()))
-        _pm3.metric("Ticket médio", fmt_brl(_mapa_base["ticket_medio_r"].mean()))
 
         _fig_cob = go.Figure()
 
@@ -2964,6 +2965,21 @@ elif painel == "Demografia":
             hoverinfo="skip",
             name=f"Densidade · {_int_label}",
         ))
+        # Raio médio (consistente com o MAPA A)
+        if _raio_medio and _raio_medio > 0:
+            _circle_lat, _circle_lon = circle_points_km(
+                SEDE_LAT, SEDE_LON, float(_raio_medio)
+            )
+            _fig_int.add_trace(go.Scattermapbox(
+                lat=_circle_lat, lon=_circle_lon, mode="lines",
+                line=dict(color="rgba(11,79,159,0.55)", width=1.5),
+                hovertemplate=(
+                    f"Raio médio ponderado por LTV: "
+                    f"{fmt_num(_raio_medio, 0)} km<extra></extra>"
+                ),
+                name=f"Raio médio ({fmt_num(_raio_medio, 0)} km)",
+                showlegend=False,
+            ))
         # Hover invisível por cidade
         _fig_int.add_trace(go.Scattermapbox(
             lat=_mapa_agg["lat"], lon=_mapa_agg["lon"], mode="markers",
@@ -3008,34 +3024,34 @@ elif painel == "Demografia":
         )
 
         # ─────────────────────────────────────────────────────────────────
-        # MAPA C — Leads prospectados (zona branca / fitness / ambos)
+        # MAPA C — Leads prospectados (zona branca — moda praia)
         # ─────────────────────────────────────────────────────────────────
-        if not _df_leads.empty:
+        if not _leads_zb.empty:
             st.divider()
             st.subheader("Leads prospectados (Google Places)")
 
-            _pc1, _pc2 = st.columns([1.3, 2])
-            with _pc1:
-                _leads_escopo = st.radio(
-                    "Escopo",
-                    ["Zona branca", "Fitness", "Ambos"],
-                    horizontal=True,
-                    key="_leads_escopo",
-                )
-            with _pc2:
-                _pcmetr1, _pcmetr2 = st.columns(2)
-                _pcmetr1.metric(
-                    "Leads zona branca",
-                    fmt_num(len(_leads_zb)),
-                    help="Lojas de moda praia/biquíni em cidades sem cliente.",
-                )
-                _pcmetr2.metric(
-                    "Leads fitness",
-                    fmt_num(len(_leads_ft)),
-                    help="Lojas de moda/roupa fitness.",
-                )
+            st.metric(
+                "Leads zona branca",
+                fmt_num(len(_leads_zb)),
+                help="Lojas de moda praia/biquíni em cidades sem cliente.",
+            )
 
             _fig_leads = go.Figure()
+
+            # Raio médio (consistente com os MAPAs A e B)
+            if _raio_medio and _raio_medio > 0:
+                _circle_lat, _circle_lon = circle_points_km(
+                    SEDE_LAT, SEDE_LON, float(_raio_medio)
+                )
+                _fig_leads.add_trace(go.Scattermapbox(
+                    lat=_circle_lat, lon=_circle_lon, mode="lines",
+                    line=dict(color="rgba(11,79,159,0.55)", width=1.5),
+                    hovertemplate=(
+                        f"Raio médio ponderado por LTV: "
+                        f"{fmt_num(_raio_medio, 0)} km<extra></extra>"
+                    ),
+                    name=f"Raio médio ({fmt_num(_raio_medio, 0)} km)",
+                ))
 
             # Fundo discreto — cidades com cliente (cinza claro, só contexto)
             if not _mapa_agg.empty:
@@ -3059,58 +3075,33 @@ elif painel == "Demografia":
                 ))
 
             # Leads zona branca (branco com contorno escuro)
-            if _leads_escopo in ("Zona branca", "Ambos") and not _leads_zb.empty:
-                _fig_leads.add_trace(go.Scattermapbox(
-                    lat=_leads_zb["lat"], lon=_leads_zb["lon"], mode="markers",
-                    marker=dict(size=13, color="rgba(31, 41, 55, 0.9)"),
-                    hoverinfo="skip",
-                    showlegend=False,
-                ))
-                _fig_leads.add_trace(go.Scattermapbox(
-                    lat=_leads_zb["lat"], lon=_leads_zb["lon"], mode="markers",
-                    marker=dict(
-                        size=10,
-                        color=CORES_COBERTURA["Zona branca"],
-                        opacity=1.0,
+            _fig_leads.add_trace(go.Scattermapbox(
+                lat=_leads_zb["lat"], lon=_leads_zb["lon"], mode="markers",
+                marker=dict(size=13, color="rgba(31, 41, 55, 0.9)"),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            _fig_leads.add_trace(go.Scattermapbox(
+                lat=_leads_zb["lat"], lon=_leads_zb["lon"], mode="markers",
+                marker=dict(
+                    size=10,
+                    color=CORES_COBERTURA["Zona branca"],
+                    opacity=1.0,
+                ),
+                text=_leads_zb.apply(
+                    lambda r: (
+                        f"<b>{r['nome']}</b><br>"
+                        f"{r['cidade']}/{r['uf']}<br>"
+                        f"Termo: {r.get('termo_busca','—')}<br>"
+                        + (f"Rating: {r['rating']} ({fmt_num(int(r['qtd_reviews']))} reviews)<br>"
+                           if pd.notna(r.get('rating')) else "")
+                        + "<i>Lead zona branca</i>"
                     ),
-                    text=_leads_zb.apply(
-                        lambda r: (
-                            f"<b>{r['nome']}</b><br>"
-                            f"{r['cidade']}/{r['uf']}<br>"
-                            f"Termo: {r.get('termo_busca','—')}<br>"
-                            + (f"Rating: {r['rating']} ({fmt_num(int(r['qtd_reviews']))} reviews)<br>"
-                               if pd.notna(r.get('rating')) else "")
-                            + "<i>Lead zona branca</i>"
-                        ),
-                        axis=1,
-                    ),
-                    hovertemplate="%{text}<extra></extra>",
-                    name=f"Zona branca ({fmt_num(len(_leads_zb))} lojas)",
-                ))
-
-            # Leads fitness (verde vibrante)
-            if _leads_escopo in ("Fitness", "Ambos") and not _leads_ft.empty:
-                _fig_leads.add_trace(go.Scattermapbox(
-                    lat=_leads_ft["lat"], lon=_leads_ft["lon"], mode="markers",
-                    marker=dict(
-                        size=10,
-                        color=CORES_COBERTURA["Fitness"],
-                        opacity=0.92,
-                    ),
-                    text=_leads_ft.apply(
-                        lambda r: (
-                            f"<b>{r['nome']}</b><br>"
-                            f"{r['cidade']}/{r['uf']}<br>"
-                            f"Termo: {r.get('termo_busca','—')}<br>"
-                            + (f"Rating: {r['rating']} ({fmt_num(int(r['qtd_reviews']))} reviews)<br>"
-                               if pd.notna(r.get('rating')) else "")
-                            + "<i>Lead fitness</i>"
-                        ),
-                        axis=1,
-                    ),
-                    hovertemplate="%{text}<extra></extra>",
-                    name=f"Fitness ({fmt_num(len(_leads_ft))} lojas)",
-                ))
+                    axis=1,
+                ),
+                hovertemplate="%{text}<extra></extra>",
+                name=f"Zona branca ({fmt_num(len(_leads_zb))} lojas)",
+            ))
 
             # Sede
             _fig_leads.add_trace(go.Scattermapbox(
@@ -3139,12 +3130,7 @@ elif painel == "Demografia":
             )
 
             # Tabela de leads do escopo atual — ranking por reviews
-            _leads_tabela = _df_leads.copy()
-            if _leads_escopo == "Zona branca":
-                _leads_tabela = _leads_tabela[_leads_tabela["tipo_lead"] == "zona_branca"]
-            elif _leads_escopo == "Fitness":
-                _leads_tabela = _leads_tabela[_leads_tabela["tipo_lead"] == "fitness"]
-            _leads_tabela = _leads_tabela.sort_values(
+            _leads_tabela = _leads_zb.sort_values(
                 ["qtd_reviews", "rating"], ascending=[False, False],
                 na_position="last",
             ).head(30).copy()
@@ -3155,14 +3141,11 @@ elif painel == "Demografia":
                 _leads_tabela["Rating"] = _leads_tabela["rating"].apply(
                     lambda v: f"{v:.1f}" if pd.notna(v) else "—"
                 )
-                _leads_tabela["Tipo"] = _leads_tabela["tipo_lead"].map(
-                    {"zona_branca": "Zona branca", "fitness": "Fitness"}
-                )
                 st.dataframe(
                     _leads_tabela.rename(columns={
                         "nome": "Loja", "cidade": "Cidade", "uf": "UF",
                         "termo_busca": "Termo",
-                    })[["Loja", "Cidade", "UF", "Tipo", "Termo",
+                    })[["Loja", "Cidade", "UF", "Termo",
                         "Rating", "Reviews"]],
                     use_container_width=True,
                     hide_index=True,
