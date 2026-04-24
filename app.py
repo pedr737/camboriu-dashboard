@@ -346,8 +346,11 @@ def calcular_score_rfv(df: pd.DataFrame) -> pd.DataFrame:
     df["v_norm"] = (df["ticket_medio_r"] / tm_seg).clip(upper=3).fillna(0)
     df["f_norm"] = (df["total_compras"] / f_seg).clip(upper=3).fillna(0)
     # r_inv mantido no DataFrame para compat com código que lê a coluna,
-    # mas não entra mais no score. Ver nota na docstring.
-    df["r_inv"]  = (1 - df["dias_sem_compra"] / 365).clip(lower=0).fillna(0)
+    # mas não entra mais no score. Denominador calibrado ao corte de "perdido"
+    # da régua atual (240 dias = 8× o gap mediano de recompra do Atacado).
+    # Se reverter para o RFV clássico (score comentado abaixo), também voltar
+    # o denominador para 365 — a régua antiga definia perdido em >365d.
+    df["r_inv"]  = (1 - df["dias_sem_compra"] / 240).clip(lower=0).fillna(0)
 
     # ── Score atual (VF): V=70% + F=30%, sem recência ───────────────────────
     df["score"]  = 0.7 * df["v_norm"] + 0.3 * df["f_norm"]

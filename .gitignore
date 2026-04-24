@@ -27,3 +27,6 @@ Thumbs.db
 
 # Cache geográfico gerado localmente
 data/*.parquet
+
+# Saídas dos scripts de análise offline (HTMLs, PNGs, CSVs regeráveis)
+analises/out/
