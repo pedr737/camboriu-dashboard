@@ -973,12 +973,17 @@ if painel == "Executivo":
     with st.expander("Definições de status de cliente", expanded=False):
         st.markdown("""
 <div class="nota-status">
-<b>Ativo</b> — última compra há menos de 90 dias<br>
-<b>Em Risco</b> — última compra entre 91 e 180 dias<br>
-<b>Hibernando</b> — última compra entre 181 e 365 dias<br>
+<b>Ativo</b> — última compra há menos de 60 dias<br>
+<b>Em Risco</b> — última compra entre 61 e 120 dias<br>
+<b>Hibernando</b> — última compra entre 121 e 240 dias<br>
 <b>Hibernando Sazonal</b> — cliente sazonal que comprou na última temporada (out–mar) mas não nesta<br>
-<b>Perdido</b> — última compra há mais de 365 dias<br>
-<b>Sem compra</b> — cadastro sem nenhuma venda registrada
+<b>Perdido</b> — última compra há mais de 240 dias<br>
+<b>Sem compra</b> — cadastro sem nenhuma venda registrada<br>
+<br>
+<span style="font-size:0.78rem; color:#5f6368;">
+Cortes calibrados ao gap mediano de recompra observado no Atacado (28 dias) —
+equivalem a 2×, 4× e 8× esse ciclo natural.
+</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1963,13 +1968,14 @@ O score é <b>relativo à carteira ativa atual</b> e separa os clientes em três
 <b>A — Alto valor (Top 5%)</b>, <b>B — Médio valor (6 a 20%)</b> e <b>C — Base (restante)</b>.
 
 <div style='margin-top:14px; padding-top:10px; border-top:1px solid #eee;'>
-<b>Status de cliente</b> (baseado na recência da última compra):
+<b>Status de cliente</b> (baseado na recência da última compra, calibrado ao
+gap mediano de recompra observado no Atacado — 28 dias):
 <ul style='margin-top:6px; margin-bottom:10px;'>
-<li><b>Ativo</b> — última compra há menos de 90 dias</li>
-<li><b>Em Risco</b> — última compra entre 91 e 180 dias</li>
-<li><b>Hibernando</b> — última compra entre 181 e 365 dias</li>
+<li><b>Ativo</b> — última compra há menos de 60 dias (≤ 2× o ciclo natural)</li>
+<li><b>Em Risco</b> — última compra entre 61 e 120 dias (2–4× o ciclo)</li>
+<li><b>Hibernando</b> — última compra entre 121 e 240 dias (4–8× o ciclo)</li>
 <li><b>Hibernando Sazonal</b> — cliente sazonal que comprou na última temporada mas não na atual</li>
-<li><b>Perdido</b> — última compra há mais de 365 dias</li>
+<li><b>Perdido</b> — última compra há mais de 240 dias (mais de 8× o ciclo)</li>
 </ul>
 </div>
 
@@ -1979,9 +1985,9 @@ Cada célula corresponde a uma ação diferente:
 
 <ul style='margin-top:6px;'>
 <li><b>Manutenção</b> (clientes ativos) — cuidar para não perder, fidelizar</li>
-<li><b>Reativação</b> (em risco, 91–180 dias) — contato rápido, janela quente</li>
-<li><b>Recuperação</b> (hibernando, 181–365 dias) — abordagem estruturada</li>
-<li><b>Monitoramento</b> (perdidos, +365 dias) — avaliar se vale o esforço</li>
+<li><b>Reativação</b> (em risco, 61–120 dias) — janela curta, contato rápido</li>
+<li><b>Recuperação</b> (hibernando, 121–240 dias) — abordagem estruturada</li>
+<li><b>Monitoramento</b> (perdidos, +240 dias) — avaliar se vale o esforço</li>
 </ul>
 
 A prioridade dentro de cada ação segue a camada: <b>A</b> é prioritária, <b>B</b> é
